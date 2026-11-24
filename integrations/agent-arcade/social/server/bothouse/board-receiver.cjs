@@ -1,6 +1,6 @@
 'use strict';
-const {execFile}=require('node:child_process');
-const {textTask}=require('./text-delivery.cjs');
+const {callBoard,executeClaim}=require('./task-executor.cjs');
+const {requiresExternalWorker,legacyBoardTask}=require('./text-delivery.cjs');
 const path=require('node:path');
 const {createHash}=require('node:crypto');
 
@@ -10,48 +10,56 @@ function scopeDirectory(root,number,chat){
   return path.join(root,createHash('sha256').update(JSON.stringify([number,chat])).digest('hex'));
 }
 
-function boardReceiver({resolveMember,runTextTask,gate,boardDir,python=process.platform==='win32'?'python':'python3'}){
+function boardReceiver({resolveMember,runTextTask,startBoardTask,textTaskCapability,gate,boardDir,python=process.platform==='win32'?'python':'python3'}){
   if(typeof resolveMember!=='function'||!path.isAbsolute(gate)||!path.isAbsolute(boardDir))
     throw Error('Bothouse work requires the connected role directory and absolute board paths');
+  const workers=new Map();
   async function identity(account,number){
     const member=await resolveMember(account,number);
     return member?.number===number&&member.configured===true&&typeof member.id==='string'&&member.id||undefined;
   }
-  function call(action,job,text,claim){
-    const member=job.identity;
-    return new Promise((resolve,reject)=>{
-      const env={};
-      for(const key of ['SystemRoot','WINDIR','PATH','TMP','TEMP','TMPDIR','LANG','LC_ALL'])
-        if(process.env[key])env[key]=process.env[key];
-      const proc=execFile(python,['-I','-B','-X','utf8',path.join(__dirname,'work_board.py'),
-        gate,scopeDirectory(boardDir,job.ai,job.chat),member,job.request,action],{windowsHide:true,timeout:6000,maxBuffer:65536,env},
-      (err,stdout)=>{
-        if(err)return reject(Error('Bothouse work board unavailable'));
-        try{resolve(JSON.parse(stdout));}catch{reject(Error('Invalid board receipt'));}
-      });
-      proc.stdin.on('error',()=>{});
-      proc.stdin.end(JSON.stringify({sender:job.human,location:'arcade:'+job.chat+'/messages/'+job.prompt,text,claim}));
-    });
+  function boardFor(job){
+    return {python,gate,scope:scopeDirectory(boardDir,job.ai,job.chat),role:job.identity,key:job.request,
+      sender:job.human,location:'arcade:'+job.chat+'/messages/'+job.prompt};
   }
-  async function step(action,job,text,permitted,progress){
+  async function step(action,job,text,permitted){
     const member=await identity(job.human,job.ai);
     if(!member||member!==job.identity||!permitted())throw Error('Bothouse role binding changed');
-    const receipt=await call(action,job,text);
-    if(action!=='status'||!runTextTask||receipt.state!=='accepted')return receipt;
-    const transform=textTask(text);
-    if(!transform||!permitted())return receipt;
-    const claim=await call('claim',job);
-    if(!claim.claimed)return claim;
-    try{
-      progress(claim);
-      if(!permitted()||await identity(job.human,job.ai)!==job.identity)throw Error('Role access revoked');
-      const answer=await runTextTask({account:job.human,number:job.ai,chat:job.chat,direct:job.direct,
-        messageId:job.request+'-'+job.attempt,scope:[job.chat,job.scope,job.request],text:transform.prompt});
-      if(!permitted()||await identity(job.human,job.ai)!==job.identity)throw Error('Role access revoked');
-      return await call('return',job,transform.render(answer?.text),claim.claimed);
-    }catch{return call('fail',job,undefined,claim.claimed);}
+    const board=boardFor(job);
+    const receipt=await callBoard(board,action,text);
+    if(receipt.state!=='accepted')return receipt;
+    if(action!=='status'||workers.size>=4||workers.has(job.request)||!permitted())return receipt;
+    const turn={account:job.human,number:job.ai,project:job.identity,chat:job.chat,direct:job.direct,
+      messageId:job.request+'-'+job.attempt,scope:[job.chat,job.scope,job.request]};
+    const capability=runTextTask&&textTaskCapability ? await textTaskCapability(turn) : {defer:'backend'};
+    if(!permitted()||await identity(job.human,job.ai)!==job.identity||!permitted())return receipt;
+    if(!capability?.available&&capability?.defer!=='backend')throw Error('Executor unavailable');
+    if(capability.defer==='backend'&&capability.legacyNative&&legacyBoardTask(text))turn.executor='legacy';
+    else turn.executor=capability.executor;
+    const handoff=!turn.executor?'backend':
+      turn.executor==='native'&&requiresExternalWorker(text)?'external':undefined;
+    const claim=await callBoard(board,'claim');
+    if(!claim.claimed||!permitted())return claim;
+    if(handoff)return callBoard(board,'defer',handoff,claim.claimed);
+    // An installed native receiver owns its connection beyond this service process.
+    // Embedded receivers keep their existing abortable in-process lifecycle.
+    const controller=startBoardTask?null:new AbortController();
+    workers.set(job.request,controller);
+    const execution=startBoardTask?startBoardTask(turn,{board,claim:claim.claimed,text})
+      :executeClaim(board,claim.claimed,text,(prompt,signal)=>runTextTask({...turn,text:prompt},signal),controller);
+    void execution.catch(error=>{
+      if(error.beforeDispatch)return callBoard(board,'fail',undefined,claim.claimed).catch(()=>{});
+    }).finally(()=>workers.delete(job.request));
+    return claim;
   }
-  return {identity,step};
+  return {
+    identity,step,
+    stop(){for(const controller of workers.values())controller?.abort();},
+    cancel(request,job){
+      workers.get(request)?.abort();
+      if(job?.board_id)void callBoard(boardFor(job),'cancel').catch(()=>{});
+    }
+  };
 }
 function directoryBoardReceiver(directory,filename,env=process.env){
   if(!directory)return;
@@ -62,7 +70,8 @@ function directoryBoardReceiver(directory,filename,env=process.env){
   const gate=env.SOCIAL_BOTHOUSE_GATE||path.join(installed,'gate');
   const boardDir=env.SOCIAL_BOTHOUSE_WORK_DIR||(filename&&path.join(path.dirname(filename),'bothouse-work'));
   if(!boardDir||!existsSync(path.join(gate,'board.py')))return;
-  return boardReceiver({runTextTask:directory.runTextTask?.bind(directory),async resolveMember(account,number){
+  return boardReceiver({runTextTask:directory.runTextTask?.bind(directory),startBoardTask:directory.startBoardTask?.bind(directory),
+    textTaskCapability:directory.textTaskCapability?.bind(directory),async resolveMember(account,number){
     const role=await directory.resolveMember(account,number);
     if(role&&!role.configured)throw Error('Bothouse role offline');
     if(!role&&directory.list&&(await directory.list(account,number)).directoryStatus==='offline')

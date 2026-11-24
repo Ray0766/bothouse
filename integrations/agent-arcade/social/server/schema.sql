@@ -5,12 +5,47 @@ CREATE TABLE IF NOT EXISTS users (
   number TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('human','ai')),
   password TEXT, CHECK ((kind='human') = (password IS NOT NULL))
 );
+CREATE TABLE IF NOT EXISTS bothouse_share_accounts (
+  account TEXT PRIMARY KEY REFERENCES users(number) ON DELETE CASCADE,
+  identity TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS human_avatars (
+  account TEXT PRIMARY KEY REFERENCES users(number) ON DELETE CASCADE,
+  revision TEXT NOT NULL,
+  mime TEXT NOT NULL CHECK(mime IN ('image/png','image/jpeg')),
+  bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 1048576)
+);
 CREATE TABLE IF NOT EXISTS sessions (
   digest TEXT PRIMARY KEY, account TEXT NOT NULL REFERENCES users, expires INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS world_visit_checks (
+  access TEXT PRIMARY KEY, session TEXT NOT NULL UNIQUE REFERENCES sessions(digest) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS world_friends_instance (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1), id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS friend_world_homes (
+  account TEXT NOT NULL REFERENCES users(number) ON DELETE CASCADE,
+  issuer TEXT NOT NULL, world TEXT NOT NULL, planet TEXT, resident_source TEXT,
+  visits TEXT NOT NULL CHECK(visits IN ('residents','allowed','closed')), revision INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY(account,issuer,world)
+);
+CREATE INDEX IF NOT EXISTS friend_world_homes_planet ON friend_world_homes(issuer,world,planet);
+CREATE TABLE IF NOT EXISTS world_resident_publishers (
+  account TEXT NOT NULL, issuer TEXT NOT NULL, world TEXT NOT NULL,
+  session TEXT NOT NULL REFERENCES sessions(digest) ON DELETE CASCADE,
+  planet TEXT NOT NULL, source TEXT NOT NULL, token TEXT NOT NULL,
+  pairing_revision TEXT,
+  PRIMARY KEY(account,issuer,world),
+  FOREIGN KEY(account,issuer,world) REFERENCES friend_world_homes(account,issuer,world) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS bothouse_pair_codes (
   account TEXT PRIMARY KEY REFERENCES users(number) ON DELETE CASCADE,
   digest TEXT NOT NULL, scope TEXT NOT NULL, expires INTEGER NOT NULL
+);
+-- Identity continuity only. This table grants no access to a role.
+CREATE TABLE IF NOT EXISTS bothouse_native_numbers (
+  legacy TEXT PRIMARY KEY, native TEXT NOT NULL UNIQUE
 );
 CREATE TABLE IF NOT EXISTS bothouse_links (
   account TEXT PRIMARY KEY REFERENCES users(number) ON DELETE CASCADE,
@@ -45,6 +80,32 @@ CREATE TABLE IF NOT EXISTS friend_posts (
   UNIQUE(author,nonce)
 );
 CREATE INDEX IF NOT EXISTS visible_friend_posts ON friend_posts(author,id DESC) WHERE removed_at IS NULL;
+CREATE TABLE IF NOT EXISTS friend_post_images (
+  post INTEGER NOT NULL REFERENCES friend_posts(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK(position BETWEEN 1 AND 3),
+  mime TEXT NOT NULL CHECK(mime IN ('image/png','image/jpeg')),
+  digest TEXT NOT NULL,
+  bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 4194304),
+  PRIMARY KEY(post,position)
+);
+CREATE TRIGGER IF NOT EXISTS clear_removed_post_images AFTER UPDATE OF removed_at ON friend_posts
+WHEN NEW.removed_at IS NOT NULL
+BEGIN
+  DELETE FROM friend_post_images WHERE post=NEW.id;
+END;
+CREATE TABLE IF NOT EXISTS friend_post_comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  post INTEGER NOT NULL REFERENCES friend_posts(id) ON DELETE CASCADE,
+  author TEXT NOT NULL REFERENCES users(number),
+  nonce TEXT NOT NULL, body TEXT NOT NULL, created TEXT NOT NULL,
+  UNIQUE(post,author,nonce)
+);
+CREATE INDEX IF NOT EXISTS comments_by_post ON friend_post_comments(post,id DESC);
+CREATE TRIGGER IF NOT EXISTS clear_removed_post_comments AFTER UPDATE OF removed_at ON friend_posts
+WHEN NEW.removed_at IS NOT NULL
+BEGIN
+  DELETE FROM friend_post_comments WHERE post=NEW.id;
+END;
 CREATE TABLE IF NOT EXISTS ai_feed_follows (
   account TEXT NOT NULL REFERENCES users(number),
   role TEXT NOT NULL REFERENCES users(number),
@@ -63,6 +124,18 @@ CREATE TABLE IF NOT EXISTS chats (
   first_user TEXT REFERENCES users, second_user TEXT REFERENCES users, created TEXT NOT NULL,
   UNIQUE(first_user,second_user)
 );
+CREATE TABLE IF NOT EXISTS friend_remarks (
+  account TEXT NOT NULL REFERENCES users(number),
+  friend TEXT NOT NULL REFERENCES users(number),
+  remark TEXT NOT NULL,
+  PRIMARY KEY(account,friend)
+);
+CREATE TABLE IF NOT EXISTS removed_friends (
+  chat TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE
+);
+CREATE VIEW IF NOT EXISTS friend_chats AS
+  SELECT c.id,c.first_user,c.second_user FROM chats c
+  WHERE c.type='direct' AND NOT EXISTS (SELECT 1 FROM removed_friends r WHERE r.chat=c.id);
 CREATE TABLE IF NOT EXISTS ai_web_search_settings (
   chat TEXT PRIMARY KEY REFERENCES chats ON DELETE CASCADE,
   enabled INTEGER NOT NULL CHECK (enabled IN (0,1)), revision INTEGER NOT NULL
@@ -122,6 +195,10 @@ CREATE TABLE IF NOT EXISTS local_reaction_scan (
   chat TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
   last_message INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS message_replies (
+  message INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+  original INTEGER NOT NULL REFERENCES messages(id)
+);
 CREATE TABLE IF NOT EXISTS message_mentions (
   message INTEGER PRIMARY KEY REFERENCES messages,
   account TEXT NOT NULL REFERENCES users
@@ -132,6 +209,13 @@ CREATE TABLE IF NOT EXISTS message_images (
   width INTEGER NOT NULL CHECK(width>0), height INTEGER NOT NULL CHECK(height>0),
   digest TEXT NOT NULL, bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 4194304)
 );
+CREATE TABLE IF NOT EXISTS saved_stickers (
+  id TEXT PRIMARY KEY,
+  account TEXT NOT NULL REFERENCES users(number) ON DELETE CASCADE,
+  message INTEGER NOT NULL REFERENCES message_images(message) ON DELETE CASCADE,
+  UNIQUE(account,message)
+);
+CREATE INDEX IF NOT EXISTS saved_stickers_account ON saved_stickers(account);
 CREATE TABLE IF NOT EXISTS message_stickers (
   message INTEGER PRIMARY KEY REFERENCES message_images(message) ON DELETE CASCADE,
   label TEXT NOT NULL
@@ -149,6 +233,11 @@ CREATE TABLE IF NOT EXISTS ai_image_turns (
 );
 CREATE INDEX IF NOT EXISTS ai_image_turn_time ON ai_image_turns(started,chat);
 CREATE UNIQUE INDEX IF NOT EXISTS ai_image_pending ON ai_image_turns(chat) WHERE state='pending';
+CREATE TABLE IF NOT EXISTS message_files (
+  message INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+  name TEXT NOT NULL, digest TEXT NOT NULL,
+  bytes BLOB NOT NULL CHECK(length(bytes)<=16777216)
+);
 CREATE TABLE IF NOT EXISTS message_voices (
   message INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
   duration_ms INTEGER NOT NULL CHECK(duration_ms BETWEEN 200 AND 120000),
@@ -250,6 +339,17 @@ AFTER UPDATE OF enabled ON ai_direct_permissions WHEN NEW.enabled=0
 BEGIN
   DELETE FROM ai_voice_scopes WHERE chat=NEW.chat;
   DELETE FROM ai_voice_choices WHERE chat=NEW.chat;
+END;
+CREATE TABLE IF NOT EXISTS message_reactions (
+  message INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  account TEXT NOT NULL REFERENCES users(number) ON DELETE CASCADE,
+  emoji TEXT NOT NULL CHECK(emoji IN ('👍','😂','❤️','😮','👏')),
+  PRIMARY KEY (message,account,emoji)
+);
+CREATE TRIGGER IF NOT EXISTS clear_removed_message_reactions
+AFTER UPDATE OF removed ON messages WHEN OLD.removed=0 AND NEW.removed=1
+BEGIN
+  DELETE FROM message_reactions WHERE message=NEW.id;
 END;
 CREATE TABLE IF NOT EXISTS message_removals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

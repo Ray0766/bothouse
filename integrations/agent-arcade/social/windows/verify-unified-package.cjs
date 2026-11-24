@@ -20,12 +20,6 @@ const profile=path.join(scratch,'profile');
 fs.mkdirSync(path.join(profile,'library'),{recursive:true});
 fs.writeFileSync(path.join(profile,'library','config.json'),JSON.stringify({language:'zh'}));
 const database=path.join(scratch,'synthetic.sqlite');
-const document=path.join(scratch,'synthetic-note.json');
-fs.writeFileSync(document,JSON.stringify({title:'合成资料',value:53}));
-const character=path.join(scratch,'synthetic-character.json');
-fs.writeFileSync(character,JSON.stringify({spec:'chara_card_v2',spec_version:'2.0',data:{
-  name:'合成角色五三',description:'A synthetic Store package fixture.',personality:'',scenario:'',first_mes:'你好',mes_example:'',
-}}));
 fs.mkdirSync(evidence,{recursive:true});
 const checks=[];
 const pageErrors=[];
@@ -72,10 +66,12 @@ async function assertBoundary(app,visible) {
     const windows=BrowserWindow.getAllWindows(),w=windows[0];
     const child=w.contentView.children.find(v=>v.webContents&&v.webContents!==w.webContents);
     const wc=child.webContents,p=wc.getLastWebPreferences();
+    const preloadReady = await wc.executeJavaScript(
+      "document.documentElement.dataset.arcadeGroupCardPicker==='available' && typeof window.arcade==='undefined'");
     const compactStoreShell=await w.webContents.executeJavaScript("!!document.getElementById('store-more')");
     return {count:windows.length,desktopVisible:w.isVisible(),guestVisible:child.getVisible(),bounds:child.getBounds(),compactStoreShell,
       url:wc.getURL(),localUrl:w.webContents.getURL(),preload:p.preload?.split(/[\\/]/).at(-1),preloads:wc.session.getPreloadScripts().length,
-      sandbox:p.sandbox,nodeIntegration:p.nodeIntegration,contextIsolation:p.contextIsolation,
+      sandbox:p.sandbox,nodeIntegration:p.nodeIntegration,contextIsolation:p.contextIsolation,preloadReady,
       separatePartition:wc.session!==w.webContents.session,profile:app.getPath('userData')};
   });
   assert.equal(view.count,1);
@@ -85,13 +81,17 @@ async function assertBoundary(app,visible) {
   assert.equal(view.bounds.y,view.compactStoreShell?44:56);
   assert.equal(new URL(view.url).origin,origin.origin);
   assert.match(view.localUrl,/\/src\/ui\/index.html/);
-  assert.deepEqual([view.preload,view.preloads,view.sandbox,view.nodeIntegration,view.contextIsolation,view.separatePartition],
-    ['privacy-preload.cjs',0,true,false,true,true]);
+  if(view.preload!==undefined)assert.equal(view.preload,'privacy-preload.cjs');
+  assert.equal(view.preloadReady,true);
+  assert.deepEqual([view.preloads,view.sandbox,view.nodeIntegration,view.contextIsolation,view.separatePartition],
+    [0,true,false,true,true]);
 }
-async function workspace(page,name) {
-  const target=page.locator('#ws-'+name);
-  if(!await target.isVisible())await page.locator('#store-more').click();
-  await target.click();
+async function settings(page) {
+  await page.locator('#store-more').click();
+  await page.locator('#store-settings').click();
+  await page.locator('#settings-back').waitFor();
+  assert.equal(await page.locator('#ai-card-open').count(),0);
+  assert.equal(await page.locator('#ws-companion, #ws-work, #settings-advanced').count(),0);
 }
 async function fillRegistration(app) {
   await guest(app,`document.querySelector('#auth-switch').click();
@@ -105,7 +105,7 @@ async function peer() {
   let cookie='';
   return async(route,body)=>{
     const response=await fetch(origin.origin+'/api/v1'+route,{method:body===undefined?'GET':'POST',
-      headers:{Cookie:cookie,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});
+      headers:{Cookie:cookie,'Content-Type':'application/json','X-Social-Claude-UI':'1','X-Social-AI-Friend-Roles':'1'},body:body===undefined?undefined:JSON.stringify(body)});
     assert.equal(response.status,200,route);
     cookie=response.headers.getSetCookie()[0]?.split(';')[0]||cookie;
     return response.json();
@@ -138,33 +138,30 @@ async function main(){
     const image=await app.evaluate(async({BrowserWindow})=>{
       const w=BrowserWindow.getAllWindows()[0];
       const v=w.contentView.children.find(c=>c.webContents&&c.webContents!==w.webContents);
-      return (await v.webContents.capturePage()).toPNG().toString('base64');
+      return (await v.webContents.capturePage(undefined,{stayHidden:true,stayAwake:true})).toPNG().toString('base64');
     });
     fs.writeFileSync(path.join(evidence,'friends.png'),Buffer.from(image,'base64'));
-    await workspace(page,'companion');
+    await guest(app,"document.querySelector('#message').value='未发送的合成草稿';document.querySelector('#message').dispatchEvent(new Event('input',{bubbles:true}))");
+    await settings(page);
     await assertBoundary(app,false);
-    assert.equal(await page.evaluate(async()=>(await window.arcade.snapshot()).bot.hasKey),false);
-    await page.locator('nav [data-view=characters]').click();
-    await app.evaluate(({dialog},file)=>{dialog.showOpenDialog=async()=>({canceled:false,filePaths:[file]});},character);
-    await page.locator('#characters-import').click();
-    await page.locator('#characters-view').getByText('合成角色五三',{exact:true}).first().waitFor();
-    await page.screenshot({path:path.join(evidence,'companion.png')});
-    await workspace(page,'work');
-    await page.locator('nav [data-view=work]').click();
-    await app.evaluate(({dialog},file)=>{dialog.showOpenDialog=async()=>({canceled:false,filePaths:[file]});},document);
-    await page.locator('#artifact-pick').click();
-    await page.frameLocator('#artifact-app').locator('#artifact-body').filter({hasText:'合成资料'}).waitFor();
-    await page.screenshot({path:path.join(evidence,'work.png')});
-    checks.push('同窗切回陪伴导入本机角色、切工作打开本机 JSON 资料');
-    await page.locator('#ws-social').click();
+    await page.locator('#settings-nav-devices').click();
+    await page.locator('#robot-device-card').waitFor();
+    const devices=await app.evaluate(async({BrowserWindow})=>{
+      const w=BrowserWindow.getAllWindows()[0];
+      return (await w.webContents.capturePage(undefined,{stayHidden:true,stayAwake:true})).toPNG().toString('base64');
+    });
+    fs.writeFileSync(path.join(evidence,'devices.png'),Buffer.from(devices,'base64'));
+    await page.locator('#settings-back').click();
     await assertBoundary(app,true);
+    assert.equal(await guest(app,"document.querySelector('#message').value"),'未发送的合成草稿');
+    checks.push('更多进入设备设置，返回原私聊并保留草稿');
     assert(await guest(app,`document.querySelector('#history').textContent.includes('合成社交历史')`));
     await guest(app,`document.querySelector('[data-tab=profile]').click();
       [...document.querySelectorAll('button')].find(e=>e.textContent==='意见反馈').click()`);
     await until(()=>guest(app,`!!document.querySelector('#feedback-text')`),'feedback form');
     await guest(app,`document.querySelector('#feedback-text').value='合成商店包意见反馈';
       document.querySelector('#feedback-text').form.querySelector('button[type=submit]').click()`);
-    await until(()=>guest(app,`document.querySelector('.feedback-history').textContent.includes('合成商店包意见反馈')`),'feedback receipt');
+    await until(()=>guest(app,`[...document.querySelectorAll('.feedback-history')].some(section=>section.textContent.includes('合成商店包意见反馈'))`),'feedback receipt');
     checks.push('同源意见反馈实际提交并回读');
     await app.close();running=null;
     running=await launch();
@@ -172,18 +169,15 @@ async function main(){
     await assertBoundary(running.app,true);
     await guest(running.app,`[...document.querySelectorAll('#directory-body button')].find(e=>e.textContent.includes('封装账号乙')).click()`);
     await until(()=>guest(running.app,`document.querySelector('#history').textContent.includes('合成社交回复')`),'durable message');
-    await workspace(running.page,'companion');
-    await running.page.locator('nav [data-view=characters]').click();
-    await running.page.locator('#characters-view').getByText('合成角色五三',{exact:true}).first().waitFor();
-    checks.push('重开包后同一好友登录和历史恢复，本机角色仍在');
+    checks.push('重开包后同一好友登录和历史恢复');
     await running.app.close();running=null;
     await stop(worker);worker=null;
     running=await launch();
     await running.page.getByRole('button',{name:'重试',exact:true}).waitFor();
-    await running.page.locator('#ws-work').click();
-    await running.page.locator('nav [data-view=work]').click();
-    await running.page.locator('#artifact-pick').waitFor();
-    checks.push('好友服务离线时仍能进入本机工作');
+    await settings(running.page);
+    await running.page.locator('#settings-nav-window').click();
+    await running.page.locator('#alwaysOnTop').waitFor();
+    checks.push('好友服务离线时仍能进入本机窗口设置');
     assert.deepEqual(pageErrors,[]);
   } finally {
     await running?.app.close();

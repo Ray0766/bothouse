@@ -1,11 +1,13 @@
 'use strict';
 const {randomUUID,createHash}=require('node:crypto');
 const {fail}=require('../store.cjs');
+const {assignmentLead}=require('./text-delivery.cjs');
 
 // Only addressed imperatives qualify. In groups the renderer sends the selected account
 // separately from the text. Never infer a recipient by scanning a display name.
 function isAssignment(text){
-  return /^(?:(?:给你(?:个|一个|一项)任务|任务交给你|请接(?:一下)?这个任务)[：:,，\s]+\S|(?:请(?:你)?|麻烦(?:你)?|帮我|请帮我)?(?:把|将)[^？?]{1,160}(?:整理(?:成|好)?|分(?:好)?类|分组|汇总|列成|归纳|排序)|(?:请(?:你)?|麻烦(?:你)?|帮我|请帮我)(?:整理|归类|汇总|分组|起草|拟一份|制作|编写|写一份|列出)\S)/u.test(text.trim()) &&
+  if(assignmentLead.test(text.trim()))return true;
+  return /^(?:(?:请(?:你)?|麻烦(?:你)?|帮我|请帮我)?(?:把|将)[^？?]{1,160}(?:整理(?:成|好)?|分(?:好)?类|分组|汇总|列成|归纳|排序)|(?:请(?:你)?|麻烦(?:你)?|帮我|请帮我)(?:翻译|总结|概括|改写|润色|提取|排序|整理|归类|汇总|分组|起草|拟一份|制作|编写|写一份|列出)\S)/u.test(text.trim()) &&
     !/[？?]\s*$/u.test(text);
 }
 
@@ -61,7 +63,7 @@ function createWorkOrders(store,receiver){
       retry(account,chat,Number(retryText[1]),{expectedAccount:account,attempt:prior.attempt});
       return true;
     }
-    if(store.one("SELECT count(*) n FROM bothouse_work_orders WHERE state IN ('queued','accepted','running') AND human=?",account).n>=16)
+    if(store.one("SELECT count(*) n FROM bothouse_work_orders WHERE state IN ('queued','accepted','running','waiting_external','waiting_backend') AND human=?",account).n>=16)
       fail(429,'task_busy','已有多条任务在处理，请稍后再派');
     store.run('INSERT INTO bothouse_work_orders(prompt,request,chat,human,ai,scope,identity) VALUES(?,?,?,?,?,?,?)',
       m.id,randomUUID(),chat,account,ai,scope,identity);
@@ -73,45 +75,58 @@ function createWorkOrders(store,receiver){
   }
   function save(job,state,text,boardId){
     store.run('UPDATE bothouse_work_orders SET state=?,board_id=coalesce(?,board_id),next_check=? WHERE prompt=?',
-      state,boardId??null,Date.now()+3000,job.prompt);
+      state,boardId??null,Date.now()+(state.startsWith('waiting_')?8000:3000),job.prompt);
     if(text)store.send(job.ai,job.chat,{clientId:'work_'+job.request+'_'+job.attempt+'_'+state,
       text:'任务 #'+job.prompt+' · '+text});
   }
+  function cancel(job){
+    receiver.cancel?.(job.request,job);
+    save(job,'cancelled');
+  }
   async function advance(job){
-    if(!current(job)){if(!closed)save(job,'cancelled');return;}
+    if(!current(job)){if(!closed)cancel(job);return;}
     let receipt;
     try{
       if(await receiver.identity(job.human,job.ai)!==job.identity||!current(job)){
-        if(!closed)save(job,'cancelled');
+        if(!closed)cancel(job);
         return;
       }
       job.direct=store.access(job.human,job.chat).type==='direct';
       receipt=await receiver.step(job.state==='queued'?(job.attempt>0?'retry':'submit'):'status',job,
-        store.one('SELECT body FROM messages WHERE id=?',job.prompt).body,()=>current(job),claim=>{
-          if(current(job)&&claim.boardId===job.board_id)store.transaction(()=>save(job,'running','正在处理',claim.boardId));
-        });
+        store.one('SELECT body FROM messages WHERE id=?',job.prompt).body,()=>current(job));
       if(receipt.key!==job.request||receipt.role!==job.identity||!Number.isSafeInteger(receipt.boardId)||receipt.boardId<=0||
-         (job.board_id!==null&&receipt.boardId!==job.board_id)||!['accepted','running','returned','failed'].includes(receipt.state))
+         (job.board_id!==null&&receipt.boardId!==job.board_id)||!['accepted','running','returned','failed','uncertain','waiting_input','waiting_external','waiting_backend'].includes(receipt.state))
         throw Error('invalid receipt');
       if(receipt.state==='returned'&&(typeof receipt.text!=='string'||!receipt.text.trim()||Array.from(receipt.text).length>3000||
          createHash('sha256').update(receipt.text).digest('hex')!==receipt.sha256))throw Error('invalid artifact');
       if(closed)return;
       const identity=await receiver.identity(job.human,job.ai);
       if(closed)return;
-      if(identity!==job.identity||!current(job)){save(job,'cancelled');return;}
+      if(identity!==job.identity||!current(job)){cancel(job);return;}
     }catch{
       if(closed)return;
-      if(!current(job)){save(job,'cancelled');return;}
+      if(!current(job)){cancel(job);return;}
+      if(job.board_id!==null){
+        store.run('UPDATE bothouse_work_orders SET next_check=? WHERE prompt=?',Date.now()+3000,job.prompt);
+        return;
+      }
       store.transaction(()=>save(job,'failed','暂时无法核实任务板回执。请发送「重试任务 #'+job.prompt+'」。'));
       return;
     }
-    const label={accepted:'已接单',running:'正在处理',failed:'执行失败。请发送「重试任务 #'+job.prompt+'」。',
+    const label={
+      accepted:'已登记到看板',
+      waiting_external:'等待执行者接手。这项任务需要在聊天外实际操作。',
+      waiting_input:'等待补充材料。请把所需原文或数据和任务一起重新交办。',
+      waiting_backend:'等待执行者接手。当前角色没有可用的文字执行接口或受支持的原生执行模式。',
+      running:'看板执行者已接手，正在核对交付内容',
+      failed:'执行失败。请发送「重试任务 #'+job.prompt+'」。',
+      uncertain:'暂时无法核实这项任务是否交回。原任务已保留。',
       returned:'已交回\n'+(receipt.text||'')};
     store.transaction(()=>save(job,receipt.state,job.state===receipt.state?null:label[receipt.state],receipt.boardId));
   }
   function poll(){
     if(closed||!receiver||active.size>=4)return;
-    for(const job of store.all("SELECT * FROM bothouse_work_orders WHERE state IN ('queued','accepted','running') AND next_check<=? ORDER BY next_check,prompt LIMIT 8",Date.now())){
+    for(const job of store.all("SELECT * FROM bothouse_work_orders WHERE state IN ('queued','accepted','running','waiting_external','waiting_backend') AND next_check<=? ORDER BY next_check,prompt LIMIT 8",Date.now())){
       if(active.has(job.prompt))continue;
       active.add(job.prompt);
       void advance(job).catch(error=>console.error('Social task polling failed',error.code||error.name))
@@ -131,6 +146,6 @@ function createWorkOrders(store,receiver){
     return store.one('SELECT prompt AS messageId,ai AS target,state,attempt,board_id AS boardId FROM bothouse_work_orders WHERE prompt=?',id);
   }
   return {prepare,stage,retry,view,start(){if(receiver)timer=setInterval(poll,500).unref();},
-    stop(){closed=true;clearInterval(timer);},wake(){setImmediate(poll);}};
+    stop(){closed=true;clearInterval(timer);receiver?.stop?.();},wake(){setImmediate(poll);}};
 }
 module.exports={createWorkOrders,isAssignment};

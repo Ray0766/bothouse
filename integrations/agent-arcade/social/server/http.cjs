@@ -1,6 +1,7 @@
 'use strict';
 const {directoryBoardReceiver}=require('./bothouse/board-receiver.cjs');
 const {createWorkOrders}=require('./bothouse/work-orders.cjs');
+const {commentPage,commentsRoute}=require('./feed-comments.cjs');
 const {chatFeedbackReview} = require('./chat-feedback-review.cjs');
 
 const http = require('node:http');
@@ -8,8 +9,10 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const net = require('node:net');
 const {createHash} = require('node:crypto');
+const {friendShareLookup}=require('./bothouse/friend-share-lookup.cjs');
 const {fail,number} = require('./store.cjs');
-const {current,makeAuth} = require('./auth.cjs');
+const {current,makeAuth,sessionDigest} = require('./auth.cjs');
+const {planetPublishers}=require('./bothouse/planet-residents.cjs');
 const {createAiDirect} = require('./ai-direct.cjs');
 const {provisionAi}=require('./ai-adapter.cjs');
 const {AI_NUMBER,AI_JU_NUMBER,AI_DRAGON_NUMBER,providerForRole}=require('./ai-roles.cjs');
@@ -18,7 +21,9 @@ const {createAiGroup} = require('./ai-group.cjs');
 const {createAiFeed} = require('./ai-feed.cjs');
 
 const {createAiProactive} = require('./ai-proactive.cjs');
-const {readImageUpload} = require('./image-upload.cjs');
+const {readFileUpload}=require('./file-upload.cjs');
+const {readImageUpload,readAvatarUpload,readFeedPostUpload} = require('./image-upload.cjs');
+const {bundledSticker,bundledStickerOptions}=require('./bundled-stickers.cjs');
 const {readVoiceUpload} = require('./voice-upload.cjs');
 const {createAiVoice} = require('./ai-voice.cjs');
 const {createImageQuestions}=require('./ai-image-questions.cjs');
@@ -77,7 +82,20 @@ function dispatch(store,a,route,body,params,clientBuild,ai,aiGroup,aiFeed,proact
     case 'POST personal-ai/profile': return {profile:personal.saveProfile(a,body)};
     case 'GET personal-ai/private-profile': return {profile:personal.publicProfile(a,true)};
     case 'POST personal-ai/private-profile': return {profile:personal.saveProfile(a,body,true)};
-    case 'GET me': return {user:store.user(a)};
+    case 'GET me': return {user:store.profile(a)};
+    case 'GET stickers': return {stickers:bundledStickerOptions(),...store.savedStickerPage(a,params.get('before'))};
+    case 'POST stickers/save': {
+      if(body.expectedAccount!==a)fail(409,'image_session','账号已切换，请重新打开会话');
+      if(typeof body.chat!=='string'||!Number.isSafeInteger(body.message)||body.message<1)
+        fail(400,'image_request','请选择一张聊天图片');
+      return store.saveSticker(a,body.chat,body.message);
+    }
+    case 'POST stickers/remove': {
+      if(body.expectedAccount!==a)fail(409,'image_session','账号已切换，请重新打开会话');
+      if(typeof body.id!=='string'||!body.id.startsWith('saved-'))fail(400,'image_request','请选择一张收藏表情');
+      store.removeSavedSticker(a,body.id);
+      return {ok:true};
+    }
     case 'GET feedback': return params.get('view')==='history'
       ? {account:a,...store.feedbackPage(a,params.get('before'))}
       : {account:a,feedback:store.feedback(a)};
@@ -92,7 +110,7 @@ function dispatch(store,a,route,body,params,clientBuild,ai,aiGroup,aiFeed,proact
     }
     case 'GET personal-ai/friend-settings': return {settings:personal.friendSettings(a)};
     case 'POST personal-ai/friend-settings': return {settings:personal.saveFriendSettings(a,body)};
-    case 'GET friends': return {friends:store.friends(a)};
+    case 'GET friends': return {account:a,friends:store.friends(a)};
     case 'GET ai-contacts': return {contacts:ai.contacts().filter(visibleRole)};
     case 'POST ai-contacts/start': guard(body.number);return ai.start(a,body);
     case 'GET friend-requests': {
@@ -110,7 +128,11 @@ function dispatch(store,a,route,body,params,clientBuild,ai,aiGroup,aiFeed,proact
     }
     case 'POST friend-requests': {
       const target=store.user(number(body.number));
-      if(target.kind==='human')return {request:store.request(a,target.number)};
+      if(target.kind==='human'){
+        if(body.expectedAccount!==undefined&&body.expectedAccount!==a)
+          fail(409,'friend_session','账号已变更，请重新打开好友申请');
+        return {request:store.request(a,target.number)};
+      }
       if(body.expectedAccount!==a)fail(403,'ai_friend_account','请在当前账号添加 AI 好友');
       const availability=personal.friendAvailability(a,target.number);
       if(availability==='private')fail(403,'personal_ai_private_friend','这位个人 AI 仅主人可添加好友');
@@ -125,10 +147,19 @@ function dispatch(store,a,route,body,params,clientBuild,ai,aiGroup,aiFeed,proact
       return {conversation:conversationView(store.conversation(a,direct.id))};
     }
     case 'POST groups': return {conversation:store.createGroup(a,body.title,humanMembers(store,body.memberNumbers))};
-    case 'GET friend-feed': return {...store.friendFeed(a,params),role:aiFeed.subscription(a),roles:aiFeed.subscriptions(a)};
+    case 'GET friend-feed': {
+      const page=store.friendFeed(a,params);
+      if(params.get('comments')==='1')for(const post of page.posts){
+        const {comments}=commentPage(store,a,post,null,2);
+        post.recentComments=comments.reverse();
+      }
+      return {...page,role:aiFeed.subscription(a),roles:aiFeed.subscriptions(a)};
+    }
     case 'POST friend-feed': return {post:store.publishFriendPost(a,body)};
     case 'POST friend-feed/follow': return aiFeed.follow(a,body);
   }
+  if(root==='friend-feed'&&parts.length===3&&action==='comments'&&['GET','POST'].includes(method))
+    return commentsRoute(store,a,id,method,params,body);
   if (root==='friend-feed'&&parts.length===3&&method==='POST'&&action==='delete')
     return store.deleteFriendPost(a,id,body);
   if (root==='friend-feed'&&parts.length===3&&method==='POST'&&action==='report')
@@ -159,8 +190,13 @@ function dispatch(store,a,route,body,params,clientBuild,ai,aiGroup,aiFeed,proact
   }
   if (root === 'conversations') {
     if (parts.length === 2 && method === 'GET') return {conversation:conversationView(store.conversation(a,id))};
+    if (parts.length===3&&method==='POST'&&action==='remove-friend')return store.removeFriend(a,id,body);
+    if (parts.length===3&&method==='POST'&&action==='friend-remark')return store.saveFriendRemark(a,id,body);
     if (parts.length === 3 && action === 'read' && method === 'POST') return store.markConversationRead(a,id,body);
-    if (parts.length === 3 && action === 'history-search' && method === 'GET') return store.historySearch(a,id,params);
+    if (parts.length === 3 && action === 'history-search' && method === 'GET') {
+      const page=store.historySearch(a,id,params);
+      return page.messages?{...page,messages:store.withMessageReactions(a,id,store.withReplyPreviews(a,id,page.messages))}:page;
+    }
     if (parts.length === 3 && action === 'ai-consent' && method === 'POST') {
       if(!claudeUi)guard(store.directAiConsent(a,id)?.ai);
       return ai.setConsent(a,id,body);
@@ -176,7 +212,12 @@ function dispatch(store,a,route,body,params,clientBuild,ai,aiGroup,aiFeed,proact
     if (parts.length === 3 && action === 'messages') {
       if (method === 'GET') {
         const page=store.historyPage(a,id,params);
-        return {...page,messages:page.messages.map(message=>personal.withVoiceOffer(a,message))};
+        const visible=store.withReplyPreviews(a,id,page.messages).map(message=>personal.withVoiceOffer(a,message));
+        const ids=params.has('reactionIds')?params.get('reactionIds').split(','):[];
+        if(ids.length>100||ids.some(value=>!(/^[1-9]\d*$/u.test(value)&&Number.isSafeInteger(Number(value)))))
+          fail(400,'cursor','消息位置无效');
+        return {...page,messages:store.withMessageReactions(a,id,visible),
+          ...(ids.length&&{reactionUpdates:store.reactionSummaries(a,id,ids.map(Number))})};
       }
       if (method === 'POST') {
         if(!bothouse&&!claudeUi)guard(store.directAiConsent(a,id)?.ai);
@@ -197,6 +238,8 @@ function dispatch(store,a,route,body,params,clientBuild,ai,aiGroup,aiFeed,proact
         return {message,directTurn,groupTurn,personalTurn,abortProactive,bothouseTurn};
       }
     }
+    if(parts.length===5&&action==='messages'&&sub==='reaction'&&method==='POST'&&/^[1-9]\d*$/u.test(msg))
+      return store.setMessageReaction(a,id,Number(msg),body);
     if(parts.length===5&&action==='messages'&&sub==='task-retry'&&method==='POST'&&/^[1-9]\d*$/u.test(msg))
       return workOrders.retry(a,id,Number(msg),body);
     if(parts.length===5&&action==='messages'&&sub==='drawing-resend'&&/^[1-9]\d*$/u.test(msg))
@@ -270,10 +313,11 @@ async function serveClient(client,url,req,res,privacyContact,publicSource,client
   res.end(req.method === 'HEAD' ? undefined : bytes);
 }
 function createServer(store,{publicOrigin,client = path.join(__dirname,'../client'),aiProvider,claudeProvider,openaiProvider,
-  groupAiProviders=[aiProvider,openaiProvider,claudeProvider].filter(Boolean),privacyContact,publicSource,voiceEngine,drawingProvider,feedClock,appointmentClock,webSearchFetch,personalAiFetch,bothouse,filename,taskReceiver=directoryBoardReceiver(bothouse,filename)} = {}) {
+  groupAiProviders=[aiProvider,openaiProvider,claudeProvider].filter(Boolean),privacyContact,publicSource,voiceEngine,drawingProvider,feedClock,appointmentClock,webSearchFetch,personalAiFetch,bothouse,filename,friendLookupToken,taskReceiver=directoryBoardReceiver(bothouse,filename)} = {}) {
   let loadedClient;
   const clientRelease=()=>loadedClient??=loadClientRelease(client);
   const auth = makeAuth(store,Boolean(publicOrigin));
+  const residents=planetPublishers({store,bothouse,socialOrigin:()=>publicOrigin||'http://127.0.0.1:'+server.address().port});
   const workOrders=createWorkOrders(store,taskReceiver);
   const web=createConversationWeb(store,webSearchFetch);
   const voiceReplies = createAiVoice(store,voiceEngine);
@@ -314,6 +358,12 @@ function createServer(store,{publicOrigin,client = path.join(__dirname,'../clien
     res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'");
     res.setHeader('Permissions-Policy','microphone=(self), camera=(), display-capture=()');
     try {
+      if(req.method==='GET' && req.url?.startsWith('/api/v1/bothouse-share-recipient?')){
+        const recipient=friendShareLookup(store,req,friendLookupToken?.());
+        res.setHeader('Content-Type','application/json; charset=utf-8');
+        res.setHeader('X-Friends-Lookup-Proof',recipient.proof);
+        return res.end(recipient.body);
+      }
       let origin;
       try { origin = new URL((publicOrigin ? 'https://' : 'http://') + req.headers.host); } catch { fail(400,'host','主机名无效'); }
       const host = origin.hostname.replace(/^\[|\]$/g,'');
@@ -338,13 +388,80 @@ function createServer(store,{publicOrigin,client = path.join(__dirname,'../clien
       }
       if (!['GET','POST'].includes(req.method)) fail(405,'method','请求方法无效');
       const [collection,chat,action,message,asset,variant]=parts;
+      if(collection==='conversations'&&parts.length===3&&action==='files'&&req.method==='POST'){
+        const account=current(store,req);
+        if(req.headers['x-social-account']!==account)fail(409,'file_session','账号已切换，请重新打开会话');
+        const scope=store.humanAttachmentAccess(account,chat,'file');
+        if(req.headers['x-social-member-revision']!==scope.membershipRevision)fail(409,'file_session','请重新打开会话');
+        const file=await readFileUpload(req);
+        if(current(store,req)!==account)fail(409,'file_session','账号已切换，请重新打开会话');
+        const sent=store.transaction(()=>store.sendFile(account,chat,file,scope.membershipRevision));
+        res.setHeader('Content-Type','application/json; charset=utf-8');
+        return res.end(JSON.stringify({message:sent}));
+      }
+      if(collection==='conversations'&&action==='messages'&&asset==='file'&&variant==='download'&&
+          parts.length===6&&req.method==='GET'&&/^[1-9]\d*$/u.test(message)){
+        const account=current(store,req);
+        if(url.searchParams.get('account')!==account)fail(409,'file_session','账号已切换，请重新打开会话');
+        const file=store.messageFile(account,chat,message);
+        res.setHeader('Content-Type','application/octet-stream');
+        res.setHeader('Content-Disposition',"attachment; filename*=UTF-8''"+encodeURIComponent(file.name).replace(/['()*]/g,c=>'%'+c.charCodeAt(0).toString(16)));
+        res.setHeader('Content-Length',file.bytes.byteLength);
+        res.setHeader('Cross-Origin-Resource-Policy','same-origin');
+        res.setHeader('X-Content-Type-Options','nosniff');
+        return res.end(file.bytes);
+      }
+      if(key==='me/avatar'&&req.method==='POST'){
+        const account=current(store,req);
+        if(req.headers['x-social-account']!==account)fail(409,'avatar_session','账号已切换，请重新打开资料');
+        const image=await readAvatarUpload(req);
+        if(current(store,req)!==account)fail(409,'avatar_session','账号已切换，请重新打开资料');
+        const user=store.transaction(()=>store.saveHumanAvatar(account,image));
+        res.setHeader('Content-Type','application/json; charset=utf-8');
+        return res.end(JSON.stringify({user}));
+      }
+      const avatarFile=collection==='avatars'&&parts.length===3&&req.method==='GET';
+      const stickerFile=collection==='stickers'&&parts.length===2&&req.method==='GET';
+      if(avatarFile||stickerFile){
+        const account=current(store,req);
+        if(stickerFile&&url.searchParams.has('account')&&url.searchParams.get('account')!==account)
+          fail(409,'image_session','账号已切换，请重新打开会话');
+        const file=avatarFile?store.humanAvatar(account,number(chat),action)
+          :chat.startsWith('saved-')?store.savedSticker(account,chat):bundledSticker(chat);
+        if(!file)fail(404,'unknown_sticker','没有找到这个表情');
+        res.setHeader('Content-Type',file.mime);
+        res.setHeader('Content-Length',file.bytes.byteLength);
+        res.setHeader('Cross-Origin-Resource-Policy','same-origin');
+        return res.end(file.bytes);
+      }
+      if(collection==='conversations'&&action==='stickers'&&parts.length===3&&req.method==='POST'){
+        const account=current(store,req);
+        const body=await jsonBody(req);
+        if(current(store,req)!==account||body.expectedAccount!==account)
+          fail(409,'image_session','账号已切换，请重新打开会话');
+        if(typeof body.clientId!=='string'||!/^[A-Za-z0-9_-]{8,100}$/u.test(body.clientId))
+          fail(400,'client_id','消息重试编号无效');
+        const saved=typeof body.sticker==='string'&&body.sticker.startsWith('saved-');
+        const message=store.transaction(()=>{
+          if(saved)return store.sendSavedSticker(account,chat,body.clientId,body.sticker,body.revision);
+          const sticker=bundledSticker(body.sticker);
+          if(!sticker)fail(404,'unknown_sticker','没有找到这个表情');
+          return store.sendHumanSticker(account,chat,body.clientId,sticker);
+        });
+        res.setHeader('Content-Type','application/json; charset=utf-8');
+        return res.end(JSON.stringify({message}));
+      }
       if(collection==='conversations'&&parts.length===3&&action==='voices'&&req.method==='POST') {
         const account=current(store,req);
         if(req.headers['x-social-account']!==account)fail(409,'voice_session','账号已切换，请重新打开会话');
-        store.humanAttachmentAccess(account,chat,'voice');
+        const scope=store.humanAttachmentAccess(account,chat,'voice');
         const voice=await readVoiceUpload(req);
         if(current(store,req)!==account)fail(409,'voice_session','账号已切换，请重新打开会话');
-        const sent=store.transaction(()=>store.sendVoice(account,chat,voice.clientId,voice));
+        const sent=store.transaction(()=>{
+          if(scope.type==='direct'&&store.access(account,chat).membershipRevision!==scope.membershipRevision)
+            fail(409,'voice_session','会话权限已变更，请重新选择语音');
+          return store.sendVoice(account,chat,voice.clientId,voice);
+        });
         res.setHeader('Content-Type','application/json; charset=utf-8');
         return res.end(JSON.stringify({message:sent}));
       }
@@ -358,13 +475,37 @@ function createServer(store,{publicOrigin,client = path.join(__dirname,'../clien
         res.setHeader('Cross-Origin-Resource-Policy','same-origin');
         return res.end(file.bytes);
       }
+      if(key==='friend-feed'&&req.method==='POST'&&
+          req.headers['content-type']?.split(';')[0].trim().toLowerCase()==='multipart/form-data'){
+        const account=current(store,req);
+        if(req.headers['x-social-account']!==account)fail(409,'feed_session','账号已切换，请重新打开好友动态');
+        const {body,images}=await readFeedPostUpload(req);
+        if(current(store,req)!==account)fail(409,'feed_session','账号已切换，请重新打开好友动态');
+        const post=store.transaction(()=>store.publishFriendPost(account,body,images));
+        res.setHeader('Content-Type','application/json; charset=utf-8');
+        return res.end(JSON.stringify({post}));
+      }
+      if(collection==='friend-feed'&&parts.length===4&&action==='images'&&req.method==='GET'){
+        const account=current(store,req);
+        const file=store.friendPostImage(account,chat,message);
+        res.setHeader('Content-Type',file.mime);
+        res.setHeader('Content-Length',file.bytes.byteLength);
+        res.setHeader('Cross-Origin-Resource-Policy','same-origin');
+        return res.end(file.bytes);
+      }
       if(collection==='conversations'&&parts.length===3&&action==='images'&&req.method==='POST') {
         const account=current(store,req);
         if(req.headers['x-social-account']!==account)fail(409,'image_session','账号已切换，请重新打开会话');
-        store.imageUploadAccess(account,chat);
+        const captureRevision=req.headers['x-social-member-revision'];
+        const scope=store.imageUploadAccess(account,chat);
+        if(captureRevision!==undefined && captureRevision!==scope.membershipRevision)fail(409,'file_session','请重新打开会话');
         const image=await readImageUpload(req);
         if(current(store,req)!==account)fail(409,'image_session','账号已切换，请重新打开会话');
-        const sent=store.transaction(()=>store.sendImage(account,chat,image.clientId,image));
+        const sent=store.transaction(()=>{
+          if((scope.type==='direct'||captureRevision!==undefined)&&store.access(account,chat).membershipRevision!==scope.membershipRevision)
+            fail(409,'file_session','会话权限已变更，请重新选择图片');
+          return store.sendImage(account,chat,image.clientId,image);
+        });
         res.setHeader('Content-Type','application/json; charset=utf-8');
         return res.end(JSON.stringify({message:sent}));
       }
@@ -394,10 +535,48 @@ function createServer(store,{publicOrigin,client = path.join(__dirname,'../clien
       const body = req.method === 'POST' ? await jsonBody(req,cardSave||privateCardSave?
         65536+PORTRAIT_BASE64_LIMIT:undefined) : null;
       let result;
-      if (req.method === 'POST' && ['register','login'].includes(key)) result = await auth.enter(key === 'register',body,req,res);
-      else if (req.method === 'POST' && key === 'logout') result = auth.logout(req,res);
+      if(req.method==='POST'&&key==='world-session-ticket/redeem'){
+        if(req.headers.origin!==undefined||req.headers.cookie!==undefined)fail(403,'planet_binding','此入口供世界服务核验登录。');
+        result=residents.redeemTicket(body);
+      } else if(req.method==='POST'&&key==='world-visit-status'){
+        if(req.headers.origin!==undefined||req.headers.cookie!==undefined)fail(403,'planet_binding','此入口供世界服务核验来访。');
+        const access=/^Bearer ([a-f0-9]{64})$/u.exec(req.headers.authorization||'')?.[1]||'';
+        result=residents.visitStatus(access,body);
+      } else if (req.method === 'POST' && ['register','login'].includes(key)) {
+        result = await auth.enter(key === 'register',body,req,res);
+        residents.endSession(sessionDigest(req));
+      } else if (req.method === 'POST' && key === 'logout') {
+        result = auth.logout(req,res);
+        residents.endSession(sessionDigest(req));
+      }
       else {
         const account = current(store,req);
+        if(req.method==='GET'&&req.headers['x-social-account']!==undefined&&
+           req.headers['x-social-account']!==account&&
+           (['ai-contacts','ai-contacts/pair','personal-ai','conversations','stickers'].includes(key)||
+            collection==='conversations'&&(!action||action==='messages')))
+          fail(409,'account_changed','请回到当前账号');
+        if((key==='world-session-ticket'&&req.method==='POST')||key==='planet-visits'){
+          const answer=key==='world-session-ticket'?residents.issueTicket(account,sessionDigest(req),body):
+            req.method==='GET'?residents.visits(account):await residents.shareVisits(account,sessionDigest(req),body);
+          if(current(store,req)!==account)fail(409,'planet_session','账号已切换，请重新打开自己的小星球。');
+          res.setHeader('Content-Type','application/json; charset=utf-8');
+          return res.end(JSON.stringify(answer));
+        }
+        if(req.method==='GET'&&key==='friend-planet'){
+          if(req.headers['x-social-account']!==undefined&&req.headers['x-social-account']!==account)
+            fail(409,'planet_session','账号已切换，请重新打开好友私聊。');
+          const answer=await residents.friendPlanet(account,number(url.searchParams.get('number')));
+          if(current(store,req)!==account)fail(409,'planet_session','账号已切换，请重新打开好友私聊。');
+          res.setHeader('Content-Type','application/json; charset=utf-8');
+          return res.end(JSON.stringify(answer));
+        }
+        if(key==='planet-residents'){
+          const answer=req.method==='GET'?residents.view(account):await residents.change(account,sessionDigest(req),body);
+          if(current(store,req)!==account)fail(409,'planet_session','账号已切换，请重新打开自己的小星球。');
+          res.setHeader('Content-Type','application/json; charset=utf-8');
+          return res.end(JSON.stringify(answer));
+        }
         if(req.method==='POST'&&collection==='conversations'&&action==='messages'&&parts.length===3&&
             req.headers['x-social-account']!==undefined&&req.headers['x-social-account']!==account)
           fail(409,'message_session','账号已切换，请重新打开会话');
@@ -417,6 +596,7 @@ function createServer(store,{publicOrigin,client = path.join(__dirname,'../clien
           if(req.method==='POST' && key==='ai-contacts/unpair'){
             bothousePairing.checkAccount(account,body.expectedAccount);
             answer=bothousePairing.revoke(store,account);
+            residents.unpair(account);
           }
           if(req.method==='GET'&&key==='ai-contacts')answer=await bothouse.list(account);
           if(req.method==='POST'&&key==='ai-contacts/start')answer=await bothouse.start(account,body);
@@ -530,7 +710,9 @@ function createServer(store,{publicOrigin,client = path.join(__dirname,'../clien
           } finally {
             if(directTurn||groupTurn)proactive.wake();
           }
-          result={message:personal.withVoiceOffer(account,store.message(store.one('SELECT * FROM messages WHERE id=?',message.id))),
+          const saved=store.message(store.one('SELECT * FROM messages WHERE id=?',message.id));
+          const [visible]=store.withReplyPreviews(account,saved.conversationId,[saved]);
+          result={message:personal.withVoiceOffer(account,visible),
             ...(reply&&{reply}),...delivered};
         }
       }
@@ -545,6 +727,8 @@ function createServer(store,{publicOrigin,client = path.join(__dirname,'../clien
   });
   server.once('listening',workOrders.start);
   server.once('close',workOrders.stop);
+  server.once('listening',residents.start);
+  server.once('close',residents.close);
   server.requestTimeout = 15000;
   server.headersTimeout = 10000;
   server.once('listening',aiFeed.start);

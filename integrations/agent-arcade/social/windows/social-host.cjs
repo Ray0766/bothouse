@@ -32,7 +32,7 @@ function mountSocial({window, WebContentsView, session, configuration, saveImage
     if (mainFrame && !inPlace) hide();
   });
 
-  return async ({active, headerBottom, focus = false, imageFeedback = false} = {}) => {
+  return async ({active, headerBottom, focus = false, imageFeedback = false, aiChatAccount} = {}) => {
     if (!active) { hide(); return true; }
     if (!Number.isFinite(headerBottom) || headerBottom < 1 || headerBottom > 200) return false;
     const epoch=visibilityEpoch;
@@ -42,6 +42,8 @@ function mountSocial({window, WebContentsView, session, configuration, saveImage
     if (!guest || guest.view.webContents.isDestroyed()) {
       remove();
       const view = createSocialView({ WebContentsView, session, configuration, saveImage, pickGroupCard, readSendShortcut,
+        pickCrop:signal=>require('./chat-capture/picker.cjs').pickChatCrop(window,signal),
+        visitFriend:request=>window.webContents.send('arcade:storeFriendVisit',request),
         isActive:()=>wanted&&guest===view&&!window.isDestroyed() });
       guest=view;
       const contents = guest.view.webContents;
@@ -70,6 +72,7 @@ function mountSocial({window, WebContentsView, session, configuration, saveImage
       if(!wasWanted)guest.activate();
       if(focus===true)guest.view.webContents.focus();
       if(imageFeedback===true)await guest.openImageFeedback(()=>wanted&&epoch===visibilityEpoch);
+      if(aiChatAccount)await guest.openWorldAiChat(aiChatAccount,()=>wanted&&epoch===visibilityEpoch);
       return true;
     }
     if (!loading) {
@@ -88,6 +91,8 @@ function mountSocial({window, WebContentsView, session, configuration, saveImage
       guest.view.webContents.focus();
     if(ready&&wanted&&imageFeedback===true&&epoch===visibilityEpoch)
       await guest.openImageFeedback(()=>wanted&&epoch===visibilityEpoch);
+    if(ready&&wanted&&aiChatAccount&&epoch===visibilityEpoch)
+      await guest.openWorldAiChat(aiChatAccount,()=>wanted&&epoch===visibilityEpoch);
     return ready;
   };
 }

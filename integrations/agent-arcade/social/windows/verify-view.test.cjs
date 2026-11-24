@@ -91,13 +91,16 @@ test('the operator endpoint is a bare HTTPS origin and test can only use loopbac
     'https://social.example.org/chat', 'https://u@social.example.org', 'https://social.example.org/?key=secret']) {
     assert.throws(() => serviceOrigin(origin, 'store'));
   }
-  for (const mode of ['test','test-signed'])
+  for (const mode of ['test','test-signed']) {
     assert.equal(serviceOrigin('http://127.0.0.1:8765', mode), 'http://127.0.0.1:8765');
-  assert.throws(() => serviceOrigin('http://192.168.1.2:8765', 'test'));
-  assert.equal(serviceOrigin('https://arcade-store.test:8765','test'),'https://arcade-store.test:8765');
+    assert.equal(serviceOrigin('https://arcade-store.test:8765', mode), 'https://arcade-store.test:8765');
+    for (const origin of ['http://192.168.1.2:8765', 'http://arcade-store.test:8765',
+      'https://arcade-store.test', 'https://other.test:8765', 'https://sub.arcade-store.test:8765',
+      'https://unrelated.example.org:8765', 'https://friends.home.arpa:8765']) {
+      assert.throws(() => serviceOrigin(origin, mode), origin);
+    }
+  }
   assert.throws(() => serviceOrigin('https://arcade-store.test:8765','store'));
-  assert.throws(() => serviceOrigin('https://unrelated.example.org:8765','test'));
-  assert.throws(() => serviceOrigin('https://friends.home.arpa:8765','test'));
 });
 
 test('production entry points reject a placeholder before checking release files',()=>{
@@ -271,6 +274,24 @@ test('only a direct friend-image download from the active main frame requests a 
   }
   const {view}=createSocialView({WebContentsView:Guest,session:{fromPartition:()=>isolated},
     configuration:{mode:'store',origin},isActive:()=>active,saveImage:async request=>{calls.push(request);}});
+  const fileUrl=url.replace('/image/download','/file/download?account=reader_a');
+  function checkFile(raw,name,allowed){
+    let blocked=false,options;
+    isolated.emit('will-download',{preventDefault(){blocked=true;}},{
+      getURL:()=>raw,getURLChain:()=>[raw],getMimeType:()=>'application/octet-stream',
+      getFilename:()=>name,setSaveDialogOptions:value=>{options=value;}
+    },view.webContents,frame);
+    assert.equal(blocked,!allowed);
+    if(allowed)assert.equal(options.defaultPath,name);
+  }
+  checkFile(fileUrl,'测量.bin',true);
+  checkFile(fileUrl,'../outside.bin',false);
+  checkFile(fileUrl,'..',false);
+  checkFile(fileUrl,'NUL.txt',false);
+  checkFile(fileUrl.replace('/27/','/0/'),'测量.bin',false);
+  checkFile(fileUrl.replace(id,'12345678-1111-2222-3333-123456789abe'),'测量.bin',false);
+  checkFile(fileUrl.replace(origin,'https://elsewhere.example'),'测量.bin',false);
+  active=false;checkFile(fileUrl,'测量.bin',false);active=true;
   function emit(raw,options={}){
     let cancelled=false;
     const {target=view.webContents,from=frame,chain=[raw],mime='image/png'}=options;
@@ -335,4 +356,128 @@ test('the visible social chat may request only its own top-frame microphone',asy
   active=true;
   caller.mainFrame.url=origin+'/';
   expect(false);
+});
+
+test('Windows rectangle tool launch is fixed and limited to the active chat frame',{skip:process.platform!=='win32'},async()=>{
+  const origin='https://social.arcade-example.com',frame={url:origin+'/#chat/12345678-1111-2222-3333-123456789abc'};
+  let active=true,missing=true,launch,handler;
+  const isolated=Object.assign(new EventEmitter(),{webRequest:{onBeforeRequest(){}},setPermissionRequestHandler(){},setPermissionCheckHandler(){}});
+  class Guest{
+    constructor(){this.webContents=Object.assign(new EventEmitter(),{mainFrame:frame,isDestroyed:()=>false,setWindowOpenHandler(){},
+      ipc:{handle(name,callback){if(name==='arcade:startChatSnip')handler=callback;}}});}
+  }
+  const {view}=createSocialView({WebContentsView:Guest,session:{fromPartition:()=>isolated},configuration:{origin,mode:'store'},isActive:()=>active,
+    spawnSnip:(exe,args,options)=>{
+      launch={exe,args,options};
+      const child=Object.assign(new EventEmitter(),{unref(){}});
+      queueMicrotask(()=>missing?child.emit('error',Object.assign(Error('fixture missing alias'),{code:'ENOENT'})):child.emit('spawn'));return child;
+    }});
+  const event={sender:view.webContents,senderFrame:frame};
+  assert.equal(await handler({...event,senderFrame:{}}),false);
+  active=false;assert.equal(await handler(event),false);active=true;
+  assert.equal(launch,undefined);
+  assert.equal(await handler(event),false);
+  missing=false;
+  assert.equal(await handler(event),true);
+  assert.equal(require('node:path').win32.basename(launch.exe),'SnippingTool.exe');
+  assert.deepEqual(launch.args,['/clip']);assert.equal(launch.options.shell,false);
+  frame.url=origin+'/privacy.html';assert.equal(await handler(event),false);
+});
+
+test('a planet visit uses the peer in the current active human conversation',async()=>{
+  const origin='http://127.0.0.1:18747',chat='31234567-1980-4000-8000-123456789abc';
+  let active=true,handler,changeDuringRead=false;
+  const sent=[],peer={account:'visitor',number:'friend'};
+  const session=Object.assign(new EventEmitter(),{
+    setPermissionRequestHandler(){},setPermissionCheckHandler(){},webRequest:{onBeforeRequest(){}},
+    async fetch(url,{headers}){
+      assert.equal(url,origin+'/api/v1/conversations/'+chat);assert.equal(headers['X-Social-Account'],'visitor');
+      if(changeDuringRead)view.webContents.mainFrame.url=origin+'/';
+      return Response.json({conversation:{type:'direct',members:[{number:'visitor',kind:'human'},{number:'friend',kind:'human'}]}});
+    }
+  });
+  class Guest{
+    constructor(){
+      this.webContents=Object.assign(new EventEmitter(),{isDestroyed:()=>false,mainFrame:{url:origin+'/#chat/'+chat},
+        ipc:{handle:(key,fn)=>{if(key==='arcade:visitFriend')handler=fn;}},setWindowOpenHandler(){}});
+    }
+  }
+  const {view}=createSocialView({WebContentsView:Guest,session:{fromPartition:()=>session},configuration:{mode:'test',origin},
+    isActive:()=>active,visitFriend:request=>sent.push(request)});
+  const event={sender:view.webContents,senderFrame:view.webContents.mainFrame};
+  assert.equal((await handler(event,peer)).state,'opened');
+  assert.equal((await handler(event,{...peer,number:'other'})).state,'changed');
+  active=false;assert.equal((await handler(event,peer)).state,'changed');
+  active=true;changeDuringRead=true;assert.equal((await handler(event,peer)).state,'changed');
+  assert.deepEqual(sent,[peer]);
+});
+
+test('the signed test desktop loads the configured HTTPS Friends origin', async () => {
+  const origin = 'https://arcade-store.test:8765';
+  const navigated = [];
+  const browserSession = Object.assign(new EventEmitter(), {
+    setPermissionRequestHandler(){}, setPermissionCheckHandler(){},
+    webRequest:{onBeforeRequest(){}},
+  });
+  class Guest {
+    constructor() {
+      this.webContents = Object.assign(new EventEmitter(), {
+        setWindowOpenHandler(){},
+        async loadURL(url){ navigated.push(url); this.emit('did-navigate', {}, url, 200); },
+      });
+    }
+  }
+  const guest = createSocialView({WebContentsView:Guest, session:{fromPartition:()=>browserSession},
+    configuration:{mode:'test-signed',origin}});
+  await guest.load();
+  assert.deepEqual(navigated,[origin]);
+});
+
+test('both release commands reject unsafe world origins before packaging or network access', () => {
+  for (const file of ['pack.cjs', 'check-store-release.cjs']) {
+    for (const [mode, origin, world, expected] of [
+      ['store', 'https://friends.arcade-distribution.com', 'https://127.0.0.1:8123', /Store requires an HTTPS DNS origin/u],
+      ['store', 'https://friends.arcade-distribution.com', 'https://world.localhost:8123', /local or reserved DNS name/u],
+      ['store', 'https://friends.arcade-distribution.com', 'https://test:user@world.arcade-distribution.com', /without credentials/u],
+      ['store', 'https://friends.arcade-distribution.com', 'https://world.arcade-distribution.com/game', /without credentials or a path/u],
+      ['test', 'https://arcade-store.test:8123', 'https://world.arcade-distribution.com', /reserved HTTPS test host/u],
+    ]) {
+      const result = spawnSync(process.execPath, [path.join(__dirname, file), '--mode='+mode,
+        '--version=1.0.20.0', '--origin='+origin, '--world-origin='+world],
+      {encoding:'utf8', windowsHide:true, timeout:10000});
+      assert.ifError(result.error);
+      assert.equal(result.status, 1, file);
+      assert.match(result.stderr, expected, file);
+    }
+  }
+});
+
+test('local crop is tied to one active chat visit and discards a late PNG', {skip:process.platform!=='win32'}, async()=>{
+  const origin='http://127.0.0.1:18747', route=origin+'/#chat/12345678-1111-2222-3333-123456789abc';
+  const frame={url:route}, handlers=new Map();
+  let pending, signal, starts=0;
+  const isolated=Object.assign(new EventEmitter(),{webRequest:{onBeforeRequest(){}},setPermissionRequestHandler(){},setPermissionCheckHandler(){}});
+  class Guest {
+    constructor(){this.webContents=Object.assign(new EventEmitter(),{mainFrame:frame,isDestroyed:()=>false,setWindowOpenHandler(){},
+      ipc:{handle:(name,fn)=>handlers.set(name,fn),on:(name,fn)=>handlers.set(name,fn)}});}
+  }
+  const {view}=createSocialView({WebContentsView:Guest,session:{fromPartition:()=>isolated},
+    configuration:{origin,mode:'test'},isActive:()=>true,pickCrop:current=>{
+      starts++;signal=current;return new Promise(resolve=>{pending=resolve;});
+    }});
+  const contents=view.webContents,event={sender:contents,senderFrame:frame};
+  const open=handlers.get('arcade:pickChatCrop');
+  assert.equal(await open({...event,senderFrame:{url:route}}),null);
+  frame.url=origin+'/privacy.html';assert.equal(await open(event),null);
+  frame.url='https://elsewhere.invalid/'+new URL(route).hash;assert.equal(await open(event),null);
+  assert.equal(starts,0);
+  frame.url=route;
+  const first=open(event);assert.equal(await open(event),null);
+  contents.emit('did-start-navigation',{},origin+'/',true,true);
+  assert(signal.aborted);pending(Uint8Array.of(1));assert.equal(await first,null);
+  const second=open(event);
+  handlers.get('arcade:cancelChatCrop')(event);assert(signal.aborted);
+  pending(Uint8Array.of(2));assert.equal(await second,null);
+  const third=open(event);pending(Uint8Array.of(3));assert.deepEqual(await third,Uint8Array.of(3));
+  assert.equal(starts,3);
 });

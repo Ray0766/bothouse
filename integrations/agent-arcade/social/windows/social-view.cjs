@@ -4,10 +4,11 @@ const { serviceOrigin } = require('./endpoint.cjs');
 const path = require('node:path');
 
 const imageDownloadPath=/^\/api\/v1\/conversations\/([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})\/messages\/[1-9]\d{0,15}\/image\/download$/u;
+const fileDownloadPath=/^\/api\/v1\/conversations\/([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})\/messages\/[1-9]\d{0,15}\/file\/download$/u;
 const chatFragment=/^#chat\/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u;
 
-function createSocialView({ WebContentsView, session, configuration, saveImage, pickGroupCard, readSendShortcut, isActive=()=>false,
-  openExternal=url=>require('electron').shell.openExternal(url) }) {
+function createSocialView({ WebContentsView, session, configuration, saveImage, pickGroupCard, pickCrop, readSendShortcut, visitFriend, isActive=()=>false,
+  spawnSnip=require('node:child_process').spawn, openExternal=url=>require('electron').shell.openExternal(url) }) {
   const origin = serviceOrigin(configuration.origin, configuration.mode);
   const {desktopVersion} = configuration;
   const browserSession = session.fromPartition('persist:arcade-social');
@@ -25,6 +26,18 @@ function createSocialView({ WebContentsView, session, configuration, saveImage, 
         /^\/source\/[a-f0-9]{40}\/[a-f0-9]{64}\.zip$/u.test(raw.slice(origin.length))){
       item.setSaveDialogOptions({filters:[{name:'ZIP',extensions:['zip']}],properties:['dontAddToRecent']});
       return;
+    }
+    if(chain.length===1 && chain[0]===raw && isTrusted(raw) && item.getMimeType()==='application/octet-stream'){
+      const url=new URL(raw),match=fileDownloadPath.exec(url.pathname);
+      if(match&&/^\?account=[a-z0-9_]{4,24}$/u.test(url.search)&&!url.hash&&frame.url===origin+'/#chat/'+match[1]){
+        const name=item.getFilename();
+        if(name && Buffer.byteLength(name)<=240 && path.win32.basename(name)===name &&
+            !/[<>:"/\\|?*\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]|[. ]$/u.test(name) &&
+            !/^(?:con|prn|aux|nul|conin\$|conout\$|(?:com|lpt)[0-9¹²³]) *(?:\.|$)/iu.test(name)){
+          item.setSaveDialogOptions({title:'保存聊天文件',defaultPath:name,properties:['dontAddToRecent']});
+          return;
+        }
+      }
     }
     event.preventDefault();
     if(!saveImage)return;
@@ -44,15 +57,77 @@ function createSocialView({ WebContentsView, session, configuration, saveImage, 
     const localImage = details.resourceType === 'image' && ['data:', 'blob:'].includes(url.protocol);
     callback({ cancel: !isTrusted(details.url) && !localImage });
   });
+  const preloadArgs=visitFriend?['--arcade-friend-visits']:[];
+  if(pickCrop && process.platform==='win32')preloadArgs.push('--arcade-chat-crop');
+  if(typeof desktopVersion==='string'&&/^[1-9]\d{0,4}(?:\.(?:0|[1-9]\d{0,4})){2}\.0$/u.test(desktopVersion))
+    preloadArgs.push('--arcade-feedback-desktop-version='+desktopVersion);
   const view = new WebContentsView({
     webPreferences: {
       session: browserSession, contextIsolation: true, nodeIntegration: false,
       sandbox: true, devTools: false, preload:path.join(__dirname,'privacy-preload.cjs'),
-      ...(typeof desktopVersion === 'string' && /^[1-9]\d{0,4}(?:\.(?:0|[1-9]\d{0,4})){2}\.0$/u.test(desktopVersion) &&
-        {additionalArguments:['--arcade-feedback-desktop-version='+desktopVersion]}),
+      ...(preloadArgs.length&&{additionalArguments:preloadArgs}),
     },
   });
   const contents = view.webContents;
+  if(visitFriend)contents.ipc?.handle('arcade:visitFriend',async(event,input)=>{
+    const frame=event.senderFrame, address=frame?.url;
+    const current=()=>isActive()&&!contents.isDestroyed()&&event.sender===contents&&frame===contents.mainFrame&&frame.url===address;
+    if(!address||!current()||!isTrusted(address))return {state:'changed'};
+    const url=new URL(address), valid=n=>typeof n==='string'&&/^[a-z0-9_]{4,24}$/u.test(n);
+    if(url.pathname!=='/'||url.search||!chatFragment.test(url.hash)||!valid(input?.account)||!valid(input?.number))return {state:'changed'};
+    try{
+      const response=await browserSession.fetch(origin+'/api/v1/conversations/'+url.hash.slice(6),{
+        credentials:'include',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(5000),
+        headers:{'X-Social-Account':input.account}});
+      if(!response.ok)return {state:response.status>=500?'offline':'changed'};
+      const {conversation}=await response.json();
+      if(!current()||conversation?.type!=='direct'||input.account===input.number||
+        ![input.account,input.number].every(n=>conversation.members?.some(m=>m.number===n&&m.kind==='human')))return {state:'changed'};
+      visitFriend({account:input.account,number:input.number});
+      return {state:'opened'};
+    }catch{return {state:'offline'};}
+  });
+  let cropVisit;
+  const cancelCrop=()=>cropVisit?.abort();
+  contents.on('did-start-navigation',(_event,_url,_inPlace,mainFrame)=>{if(mainFrame)cancelCrop();});
+  contents.once('destroyed',cancelCrop);
+  contents.ipc?.on?.('arcade:cancelChatCrop',event=>{
+    if(event.sender===contents && event.senderFrame===contents.mainFrame)cancelCrop();
+  });
+  if(pickCrop)contents.ipc?.handle('arcade:pickChatCrop',async event=>{
+    const frame=event.senderFrame, address=frame?.url;
+    if(cropVisit || process.platform!=='win32' || !isActive() || event.sender!==contents ||
+        frame!==contents.mainFrame || !isTrusted(address))return null;
+    const url=new URL(address);
+    if(url.pathname!=='/' || url.search || !chatFragment.test(url.hash))return null;
+    const visit=new AbortController();
+    cropVisit=visit;
+    try {
+      const bytes=await pickCrop(visit.signal);
+      return !visit.signal.aborted && isActive() && !contents.isDestroyed() &&
+        contents.mainFrame===frame && frame.url===address ? bytes : null;
+    } finally { cropVisit=undefined; }
+  });
+  let openingSnip=false;
+  contents.ipc?.handle('arcade:startChatSnip',async(event)=>{
+    const frame=event.senderFrame;
+    if(process.platform!=='win32'||openingSnip||event.sender!==contents||!frame||frame!==contents.mainFrame||
+        !isActive()||contents.isDestroyed()||!isTrusted(frame.url))return false;
+    const address=new URL(frame.url);
+    if(address.pathname!=='/'||address.search||!chatFragment.test(address.hash))return false;
+    const local=process.env.LOCALAPPDATA;
+    if(!local||!path.isAbsolute(local))return false;
+    openingSnip=true;
+    try{
+      // Invoke the installed Windows package alias. Only the user's later paste enters the page.
+      const alias=path.join(local,'Microsoft','WindowsApps','Microsoft.ScreenSketch_8wekyb3d8bbwe','SnippingTool.exe');
+      const child=spawnSnip(alias,['/clip'],{shell:false,stdio:'ignore',windowsHide:false});
+      return await new Promise(resolve=>{
+        child.once('error',()=>resolve(false));
+        child.once('spawn',()=>{child.unref();resolve(true);});
+      });
+    }finally{openingSnip=false;}
+  });
   function publishSendShortcut() {
     if(!readSendShortcut||contents.isDestroyed()||!isTrusted(contents.mainFrame?.url)||
         new URL(contents.mainFrame.url).pathname!=='/')return;
@@ -198,12 +273,24 @@ function createSocialView({ WebContentsView, session, configuration, saveImage, 
         );
       } catch { /* The user can return to the preview and retry. */ }
     },
+    async openWorldAiChat(account,current) {
+      if(typeof account!=='string'||!/^[a-z0-9_]{4,24}$/u.test(account))return;
+      const onAppPage=()=>!contents.isDestroyed()&&isTrusted(contents.mainFrame?.url)&&
+        new URL(contents.mainFrame.url).pathname==='/';
+      try {
+        if (!onAppPage()&&current()&&isActive())await this.load();
+        if (onAppPage()&&current()&&isActive())await contents.executeJavaScript(
+          'window.dispatchEvent(new CustomEvent("arcade-world-ai-chat",{detail:'+JSON.stringify(account)+'}))'
+        );
+      }catch { /* The service or page may have closed while returning. */ }
+    },
     activate() {
       publishSendShortcut();
       if(!contents.isDestroyed())
         void contents.executeJavaScript('window.dispatchEvent(new Event("arcade-social-activate"))').catch(()=>{});
     },
     deactivate() {
+      cancelCrop();
       cancelCardVisit();
       if(!contents.isDestroyed())
         void contents.executeJavaScript('window.dispatchEvent(new Event("arcade-social-deactivate"))').catch(()=>{});

@@ -2,15 +2,60 @@
 
 const {ipcRenderer}=require('electron');
 if(process.isMainFrame&&location.pathname==='/'&&!location.search){
+  if(process.argv.includes('--arcade-friend-visits')){
+    require('electron').contextBridge.exposeInMainWorld('arcadeWorldVisit',{
+      open:({account,number})=>ipcRenderer.invoke('arcade:visitFriend',{account,number}),
+    });
+  }
   const versionArgument='--arcade-feedback-desktop-version=';
   const desktopVersion=process.argv.find(arg=>arg.startsWith(versionArgument))?.slice(versionArgument.length);
   document.addEventListener('DOMContentLoaded',()=>{
     document.documentElement.dataset.arcadeGroupCardPicker='available';
     document.documentElement.dataset.arcadeGroupLorebookPicker='available';
     document.documentElement.dataset.arcadePersonalCardPicker='direct-portrait';
+    if(process.argv.includes('--arcade-chat-crop'))document.documentElement.dataset.arcadeChatCrop='available';
     if(desktopVersion)document.documentElement.dataset.arcadeFeedbackDesktopVersion=desktopVersion;
   },{once:true});
+  let snipRequest=0;
   document.addEventListener('click',async event=>{
+    const screenshot=event.target?.closest?.('button#chat-screenshot');
+    if(screenshot && event.isTrusted && event.button===0 && !screenshot.disabled && !screenshot.hidden){
+      const request=String(++snipRequest),address=location.href;
+      screenshot.dataset.arcadeSnipRequest=request;
+      let started=false;
+      try{started=await ipcRenderer.invoke('arcade:startChatSnip')===true;}catch{}
+      // Let the initiating click open its preview even if IPC resolves immediately.
+      setTimeout(()=>{
+        if(screenshot.isConnected&&location.href===address)
+          screenshot.dispatchEvent(new CustomEvent('arcade-chat-snip-result',{detail:JSON.stringify({request,started})}));
+      },0);
+      return;
+    }
+    const crop=event.target?.closest?.('button[data-chat-crop]');
+    if(crop && event.isTrusted && event.button===0 && !crop.disabled && !crop.hidden &&
+        process.argv.includes('--arcade-chat-crop')){
+      const dialog=crop.closest('dialog[open]'), input=crop.form?.querySelector('input[type=file]');
+      if(!dialog || !input)return;
+      const address=location.href;
+      const current=()=>location.href===address && crop.isConnected && dialog.open && crop.form?.contains(input);
+      const observer=new MutationObserver(()=>{
+        if(!current())ipcRenderer.send('arcade:cancelChatCrop');
+      });
+      observer.observe(dialog,{attributes:true,attributeFilter:['open'],childList:true,subtree:true});
+      crop.disabled=true;
+      try{
+        const bytes=await ipcRenderer.invoke('arcade:pickChatCrop');
+        if(bytes?.length && current()){
+          const transfer=new DataTransfer();
+          transfer.items.add(new File([bytes],'截图.png',{type:'image/png'}));
+          input.files=transfer.files;
+          input.dispatchEvent(new Event('change',{bubbles:true}));
+        }
+      }catch{
+        if(current())crop.dispatchEvent(new Event('arcade-crop-failed'));
+      }finally{observer.disconnect();crop.disabled=false;}
+      return;
+    }
     const button=event.target?.closest?.('button[data-arcade-group-card-picker]');
     if(!button||!event.isTrusted||event.button!==0||button.disabled)return;
     const {groupId,roleId,roleRevision,kind,cardScope}=button.dataset;

@@ -1,4 +1,7 @@
+import { mountConversationList } from './conversation-list.js';
+import { quoteControl,focusOriginal } from './message-reply.js';
 import { VoiceQueuePlayer } from './voice-queue-player.js';
+import { humanAvatarUrl, prepareAvatar, readImageData } from './avatar-image.js';
 const startupUrl=new URL(location.href);
 if(startupUrl.searchParams.has('friends-reload')){
   startupUrl.searchParams.delete('friends-reload');
@@ -6,6 +9,7 @@ if(startupUrl.searchParams.has('friends-reload')){
 }
 const $ = selector => document.querySelector(selector);
 const root = $('#workspace'), auth = $('#auth'), dialog = $('#dialog'), directory = $('#directory-body');
+const conversationList = mountConversationList(directory,renderDirectory);
 const feed = $('#friend-feed'), feedPosts = $('#feed-posts'), feedStatus = $('#feed-status');
 const historyView = $('#history'), messageBox = $('#message'), composer = $('#composer');
 const chatSettings=$('#chat-settings'), messageActions=$('#message-actions');
@@ -31,28 +35,104 @@ const removedMessages=new Set();
 let authMode = 'login', authFlight = false;
 const drafts = new Map(), sending = new Set();
 const chatDraftKey = 'arcade.chat.drafts';
-let interruptedDrafts;
+const localDraftPrefix = 'arcade.chat.local.v1:';
+let interruptedDrafts, draftScope;
+
 function savedChatDrafts() {
   try { return JSON.parse(sessionStorage.getItem(chatDraftKey)); } catch { return null; }
 }
 function persistChatDrafts() {
   try {
-    const saved=user?{account:user.number,entries:[...drafts]}:interruptedDrafts;
+    const saved=user?{account:user.number,entries:[...drafts],draftEpoch:draftScope?.epoch}:interruptedDrafts;
     if(saved?.entries.length)sessionStorage.setItem(chatDraftKey,JSON.stringify(saved));
     else sessionStorage.removeItem(chatDraftKey);
   } catch {}
 }
+function openDraftScope(account) {
+  const root=localDraftPrefix+account+':';
+  try {
+    const epoch=localStorage.getItem(root)??'';
+    return {root,epoch,prefix:root+epoch+':',tabOnly:new Set()};
+  } catch { return undefined; }
+}
+function localDraftKeys(scope) {
+  if(!scope)return [];
+  try {
+    return Object.keys(localStorage).filter(key=>key.startsWith(scope.prefix));
+  } catch { return []; }
+}
+function readLocalDraft(key) {
+  try { return JSON.parse(localStorage.getItem(key))??undefined; } catch { return undefined; }
+}
+function writeLocalDraft(id,value) {
+  if(!draftScope)return;
+  const {root,epoch,prefix,tabOnly}=draftScope;
+  try {
+    if((localStorage.getItem(root)??'')!==epoch)return;
+    localStorage.setItem(prefix+id,JSON.stringify({draft:value??null,at:Date.now()}));
+    tabOnly.delete(id);
+  } catch { tabOnly.add(id); }
+}
+function clearLocalDrafts() {
+  if(!draftScope)return;
+  try {
+    // Invalidate still-open tabs before deleting the old account's drafts.
+    localStorage.setItem(draftScope.root,clientNonce());
+    for(const key of localDraftKeys(draftScope))localStorage.removeItem(key);
+  } catch {}
+}
 function restoreChatDrafts(account) {
   const saved=interruptedDrafts??savedChatDrafts();
+  const expiring=interruptedDrafts?.account===account;
   interruptedDrafts=undefined;
+  draftScope=openDraftScope(account);
   drafts.clear();
-  try {
-    if(saved?.account===account)
-      for(const [id,draft] of saved.entries)drafts.set(id,draft);
-  } catch { drafts.clear(); }
+  let latest;
+  for(const key of localDraftKeys(draftScope)){
+    const id=key.slice(draftScope.prefix.length),record=readLocalDraft(key);
+    if(!record?.draft)continue;
+    drafts.set(id,record.draft);
+    if(!latest||record.at>=latest.at)latest={id,at:record.at};
+  }
+  if(saved?.account===account&&Array.isArray(saved.entries)){
+    for(const entry of saved.entries){
+      if(!Array.isArray(entry))continue;
+      const [id,draft]=entry;
+      if(typeof id!=='string'||!draft||(draftScope?.epoch&&saved.draftEpoch!==draftScope.epoch)||
+         draftScope&&readLocalDraft(draftScope.prefix+id))continue;
+      drafts.set(id,draft);
+      writeLocalDraft(id,draft);
+      latest??={id,at:0};
+    }
+  }
   persistChatDrafts();
-  return drafts.has(saved?.resumeChat)?saved.resumeChat:undefined;
+  const resume=saved?.account===account&&saved.resumeChat;
+  return drafts.has(resume)?resume:(!expiring&&latest?.id)||undefined;
 }
+function refreshLocalDraft(id) {
+  if(!draftScope||draftScope.tabOnly.has(id))return false;
+  const record=readLocalDraft(draftScope.prefix+id);
+  if(!record)return false;
+  let draft=record.draft??undefined;
+  if(id===chat&&conversation&&draft&&
+     (draft.floor!==historyFloor||draft.membershipRevision&&draft.membershipRevision!==membershipRevision))
+    draft=undefined;
+  if(JSON.stringify(drafts.get(id))===JSON.stringify(draft))return false;
+  if(draft)drafts.set(id,draft);
+  else drafts.delete(id);
+  persistChatDrafts();
+  if(id===chat&&conversation){
+    if(messageBox.value!==(draft?.text||''))messageBox.value=draft?.text||'';
+    showChatHeader();
+  }
+  return true;
+}
+window.addEventListener('storage',event=>{
+  const scope=draftScope;
+  if(!user||!scope||event.storageArea!==localStorage)return;
+  if(event.key===scope.root){leaveSession();return;}
+  if(event.key?.startsWith(scope.prefix))refreshLocalDraft(event.key.slice(scope.prefix.length));
+});
 function suspendChatDrafts(account,entries,resumeChat) {
   if(!account||!Array.isArray(entries))return;
   const eligible=[];
@@ -63,7 +143,7 @@ function suspendChatDrafts(account,entries,resumeChat) {
     const text=body&&body.trim();
     if(!text||!draft.membershipRevision||draft.attempt?.text===text||
       draft.submittedPhotoText===text)continue;
-    eligible.push([id,{text:body,floor:draft.floor,membershipRevision:draft.membershipRevision}]);
+    eligible.push([id,{text:body,...(draft.replyTo&&{replyTo:draft.replyTo}),floor:draft.floor,membershipRevision:draft.membershipRevision}]);
   }
   return {account,entries:eligible,resumeChat:eligible.some(([id])=>id===resumeChat)?resumeChat:undefined};
 }
@@ -74,8 +154,9 @@ function noticeExpiredSession() {
 }
 function updateChatDraft(id,changes) {
   const draft={...drafts.get(id),...(id===chat&&conversation&&{membershipRevision}),...changes};
-  if(draft.text||draft.target||draft.attempt)drafts.set(id,draft);
+  if(draft.text||draft.target||draft.replyTo||draft.attempt)drafts.set(id,draft);
   else drafts.delete(id);
+  writeLocalDraft(id,drafts.get(id));
   persistChatDrafts();
 }
 const feedbackDraftKey = 'arcade.feedback.pending';
@@ -149,7 +230,7 @@ function field(label, name, max, value = '') {
   return {node,input};
 }
 const roleArt=new Map([['arcade_ju','ju'],['arcade_whale','whale'],['arcade_dragon','dragon']]);
-function avatar(name, seed = name, artwork) {
+function avatar(name, seed = name, artwork, artworkClass='role-avatar') {
   const node = el('span', Array.from(name?.trim() || '聊')[0], 'avatar');
   node.dataset.tone = String(Array.from(seed || '').reduce((n,c) => n + c.codePointAt(0),0)%4);
   node.setAttribute('aria-hidden','true');
@@ -158,18 +239,22 @@ function avatar(name, seed = name, artwork) {
     portrait.alt='';
     portrait.src=artwork;
     portrait.addEventListener('error',()=>{
-      node.classList.remove('role-avatar');
+      node.classList.remove(artworkClass);
       node.textContent=Array.from(name?.trim()||'聊')[0];
     },{once:true});
-    node.classList.add('role-avatar');
+    node.classList.add(artworkClass);
     node.replaceChildren(portrait);
   }
   return node;
 }
+const personAvatar=person=>avatar(person.displayName,person.number,humanAvatarUrl(person),'human-avatar');
 function time(value, format=date) {
   return value && !Number.isNaN(Date.parse(value)) ? format.format(new Date(value)) : '';
 }
 function textError(error) {
+  if(error.message==='file_name')return '文件名含不支持的字符，请重命名后再选择。';
+  if(error.message==='file_too_large')return '文件超过 16 MiB，请选择较小的文件。';
+  if(error.message==='file_session')return '账号或群成员身份已变化，请重新打开目标会话。';
   if(error.message==='invalid_pair')return '这个配对码已过期、已使用或属于其他好友账号。请向分享者索取新码。';
   if(error.message==='pair_code')return '请粘贴分享者给你的完整配对码。';
   if(error.message==='bothouse_unavailable')return '这位角色暂不可用。请到桌面 App 的「更多 → Bothouse」查看。';
@@ -177,6 +262,11 @@ function textError(error) {
   if (error.message === 'feed_role_unavailable') return '这位角色暂时无法发表新动态。请稍后再试。';
   if (error.message === 'feed_removed') return '这条动态已删除。再次发布会创建新动态。';
   if (error.message === 'feed_conflict') return '发布编号冲突，请重新打开发布窗口。';
+  if (error.message === 'feed_image_limit') return '每条动态最多 3 张图片，每张不超过 4 MB。';
+  if (error.message === 'feed_upload_busy') return '动态图片上传正忙，请稍后重试。';
+  if (error.message === 'image_format') return '请选择静态 PNG 或 JPEG。';
+  if (error.message === 'image_too_large') return '图片文件或分辨率过大，请选择较小的图片。';
+  if (error.message === 'image_invalid') return '图片损坏、格式不符或含动画，请重新选择。';
   if (error.message === 'ai_cloud_off') return '本段私聊的云聊天已关闭。';
   if (error.message === 'ai_consent_changed') return '云聊天设置已改变，请查看当前状态后再操作。';
   if (error.message === 'ai_provider_confirmation') return '请刷新好友页面或使用新版，再确认 OpenAI（GPT）授权。';
@@ -192,8 +282,10 @@ function textError(error) {
   if (error.message === 'mention_unavailable') return '点名对象已不在群里，请取消或重新选择。';
   if (error.message === 'feedback_build') return '客户端已更新。请刷新后重新打开反馈，你的内容仍在。';
   if (error.message === 'feedback_session') return '账号已切换，请重新登录后再查看反馈。';
+  if (error.message === 'reaction_session') return '会话权限已变化，请重新打开后回应。';
   if (error.message === 'report_session') return '账号已切换，请重新打开会话再举报。';
   if (error.message === 'image_session') return '账号已切换，请重新打开会话。';
+  if (error.message === 'sticker_session') return '会话权限已变更，请重新打开表情包。';
   if (error.status === 413) return '图片超过大小或尺寸限制，请换一张。';
   if (error.status === 415 || error.status === 422) return '请选择可打开的静态 PNG 或 JPEG。';
   if (!error.status) return '暂时连不上服务，请检查网络后重试。';
@@ -204,15 +296,18 @@ function textError(error) {
   if (error.status === 429) return '操作太频繁，请稍后再试。';
   return error.status === 400 ? '请检查填写内容后重试。' : '服务暂时不可用，请稍后再试。';
 }
-async function api(route, body, {session = true, expectedAccount, image, voice, timeoutMs=12000} = {}) {
+async function api(route, body, {session = true, expectedAccount, image, voice, fileUpload, timeoutMs=12000} = {}) {
   const epoch = generation;
-  const attachment = image || voice;
+  const attachment = image || voice || fileUpload;
+  const formData = body instanceof FormData;
   const response = await fetch('./api/v1' + route, {
     method:body === undefined ? 'GET' : 'POST',
     headers:{'X-Social-Claude-UI':'1','X-Social-AI-Friend-Roles':'1',...(expectedAccount && {'X-Social-Account':expectedAccount}),
-      ...(body !== undefined && {'Content-Type':attachment?.mime||'application/json',
-      ...(attachment && {'X-Social-Client-Id':attachment.clientId})})},
-    ...(body !== undefined && {body:attachment?body:JSON.stringify(body)}),
+      ...(body !== undefined && !formData && {'Content-Type':attachment?.mime||'application/json',
+      ...(attachment && {'X-Social-Client-Id':attachment.clientId}),
+      ...(attachment?.revision && {'X-Social-Member-Revision':attachment.revision}),
+      ...(fileUpload && {'X-Social-File-Name':encodeURIComponent(fileUpload.name)})})},
+    ...(body !== undefined && {body:attachment||formData?body:JSON.stringify(body)}),
     credentials:'same-origin', cache:'no-store', signal:AbortSignal.timeout(timeoutMs)
   });
   const payload = await response.json().catch(() => null);
@@ -243,11 +338,25 @@ function toggleAuthMode(mode) {
   $('#auth-error').textContent = '';
 }
 function leaveSession({discardFeedback=false,expired=false}={}) {
+  closeStartMenu();
+  if(expired)for(const key of localDraftKeys(draftScope))refreshLocalDraft(key.slice(draftScope.prefix.length));
   interruptedDrafts=expired?suspendChatDrafts(user?.number,[...drafts],chat):undefined;
-  if(discardFeedback&&currentFeedbackDraft(user?.number))feedbackPending(null);
+  if(interruptedDrafts){
+    interruptedDrafts.draftEpoch=draftScope?.epoch;
+    const safeDrafts=new Map(interruptedDrafts.entries);
+    for(const id of drafts.keys())writeLocalDraft(id,safeDrafts.get(id));
+  }
+  if(discardFeedback){
+    clearLocalDrafts();
+    if(currentFeedbackDraft(user?.number))feedbackPending(null);
+  }
+  draftScope=undefined;
   stopVoicePlayback();
   ++generation;
   user = null;
+  conversationList.scope();
+  contactQuery.value='';
+  contactSearch.hidden=true;
   chatPortrait=undefined;
   chat = conversation = historyContext = historyFinder = undefined;
   friends = incoming = outgoing = conversations = messages = [];
@@ -301,8 +410,18 @@ async function enterSession(account) {
   $('#sync-status').textContent = '';
   renderDirectory();
   if(resumeChat&&!location.hash)window.history.replaceState(null,'','#chat/'+encodeURIComponent(resumeChat));
+  const startInChat=!location.hash&&matchMedia('(min-width: 681px)').matches;
   await openFromUrl();
-  if (epoch === generation) await sync();
+  const visit=chatVisit;
+  if (epoch !== generation)return;
+  await sync();
+  if(startInChat&&epoch===generation&&visit===chatVisit&&tab==='messages'&&!location.hash&&!chat&&!dialog.open){
+    const first=conversations[0];
+    if(first){
+      window.history.replaceState(null,'','#chat/'+encodeURIComponent(first.id));
+      await openChat(first.id);
+    }
+  }
 }
 const authSwitch = $('#auth-switch'), authSubmit = $('#auth-submit'), authError = $('#auth-error');
 authSwitch.addEventListener('click',()=>{
@@ -357,7 +476,7 @@ $('#auth-form').addEventListener('submit', async event => {
     if(focusLogin)authSwitch.focus();
   }
 });
-function row(name, description, seed, action, extra = '', identity = '', unread = false) {
+function row(name, description, seed, action, extra = '', identity = '', unread = false, person) {
   const content = el('span');
   const title = el('strong',name);
   if(identity||unread) {
@@ -369,7 +488,7 @@ function row(name, description, seed, action, extra = '', identity = '', unread 
   } else content.append(title);
   content.append(el('small',description));
   const node = button('',action,'row');
-  node.append(avatar(name,seed),content);
+  node.append(person?personAvatar(person):avatar(name,seed),content);
   if(identity||unread)node.setAttribute('aria-label',[name,identity,description,extra,unread?'未读':''].filter(Boolean).join('，'));
   if(extra) node.append(el('time',extra));
   return node;
@@ -423,8 +542,51 @@ function ownNumberControls() {
   });
   return [number.node,copy,status];
 }
+directory.addEventListener('keydown',event=>{
+  const row=event.target.closest('[data-chat-id]');
+  if(!row||event.altKey||event.ctrlKey||event.metaKey||event.shiftKey)return;
+  const rows=[...directory.querySelectorAll('[data-chat-id]')];
+  const i=rows.indexOf(row);
+  const next={ArrowDown:Math.min(i+1,rows.length-1),ArrowUp:Math.max(i-1,0),Home:0,End:rows.length-1}[event.key];
+  if(next===undefined)return;
+  event.preventDefault();
+  rows[next].focus();
+});
+const clockTime=new Intl.DateTimeFormat('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false});
+const dayStamp=new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric'});
+function listTime(value){
+  if(!value)return '';
+  const day=new Date(value);
+  return time(value,day.toDateString()===new Date().toDateString()?clockTime:dayStamp);
+}
+const startMenu=$('#start-chat-menu');
+function closeStartMenu(){
+  if(startMenu)startMenu.open=false;
+}
+$('#start-new-group')?.addEventListener('click',()=>{closeStartMenu();showMemberPicker();});
+$('#start-add-friend')?.addEventListener('click',()=>{closeStartMenu();showSearch();});
+document.addEventListener('click',event=>{
+  if(startMenu?.open&&!startMenu.contains(event.target))closeStartMenu();
+});
+startMenu?.addEventListener('keydown',event=>{
+  if(event.key==='Escape'){closeStartMenu();startMenu.querySelector('summary').focus();}
+});
+const contactSearch=el('div',null,'conversation-search');
+contactSearch.hidden=true;
+const contactQuery=el('input');
+contactQuery.type='search';
+contactQuery.placeholder='搜索备注、昵称或用户号';
+contactQuery.setAttribute('aria-label','搜索通讯录');
+contactQuery.setAttribute('aria-controls',directory.id);
+contactQuery.maxLength=100;
+contactSearch.append(contactQuery);
+directory.parentElement.querySelector('header').append(contactSearch);
+contactQuery.addEventListener('input',renderDirectory);
+const contactText=value=>(value??'').normalize('NFKC').trim().toLowerCase();
 function renderDirectory() {
   if(!user) return;
+  conversationList.scope(user.number,tab==='messages');
+  contactSearch.hidden=tab!=='contacts';
   renderUnreadNavigation();
   const badge=$('#contact-count');
   badge.hidden=!incoming.length;
@@ -437,43 +599,58 @@ function renderDirectory() {
   tabs.forEach(node=>node.setAttribute('aria-current',node.dataset.tab===tab?'page':'false'));
   root.classList.toggle('show-feed',tab==='feed');
   feed.hidden=tab!=='feed';
+  if(startMenu){
+    startMenu.hidden=tab!=='messages';
+    if(startMenu.hidden)closeStartMenu();
+  }
   if(tab==='feed')return;
   const actions=$('#directory-actions');
   actions.replaceChildren();
   if(tab==='messages') {
-    actions.append(button('发起群聊',()=>showMemberPicker()),button('添加朋友',showSearch));
+    if(!startMenu)actions.append(button('发起群聊',()=>showMemberPicker()),button('添加朋友',showSearch));
     const directNames=new Map();
     for(const item of conversations) {
       if(item.type!=='direct')continue;
       const name=item.title.normalize('NFC');
       directNames.set(name,(directNames.get(name)||0)+1);
     }
-    const rows=conversations.map(item=>{
+    conversationList.render(conversations,item=>{
       const latest=item.lastMessage, summary=latest?latest.text:item.type==='group'?'群聊已建立':'开始发消息';
       const peer=item.type==='direct'?item.members.find(person=>person.number!==user.number):null;
       const identity=peer?.kind==='ai'?'AI 联系人':
         peer&&(directNames.get(item.title.normalize('NFC'))>1)?peer.number:'';
       const unread=hasUnread(item);
-      const node=row(item.title,summary,peer?.kind==='ai'?peer.number:item.id,()=>goChat(item.id),time(latest?.createdAt),identity,unread);
+      const node=row(item.title,summary,peer?.kind==='ai'?peer.number:item.id,event=>goChat(item.id,event.detail===0),listTime(latest?.createdAt),identity,unread,peer);
+      // OpenIM ConversationItem's two-line grid: name/time above, preview across the second line.
+      const content=node.children[1], stamp=node.querySelector('time');
+      content.classList.add('conversation-copy');
+      if(stamp)content.insertBefore(stamp,content.lastElementChild);
+      if(identity&&peer?.kind==='human'){
+        const accountLabel=content.querySelector('.row-identity');
+        accountLabel.title=identity;
+        content.insertBefore(accountLabel,content.lastElementChild);
+      }
       node.dataset.chatId=item.id;
       node.setAttribute('aria-current',String(chat===item.id));
       return node;
-    });
-    directory.replaceChildren(...(rows.length?rows:[empty('暂无消息。添加朋友后就能开始聊天。')]));
+    },empty);
   }
   if(tab==='contacts') {
     actions.append(button('添加朋友',showSearch),button('新的朋友'+(incoming.length?'（'+incoming.length+'）':''),showRequests),button('发起群聊',()=>showMemberPicker()));
     actions.append(button('AI 联系人',showAiContacts));
-    const rows=friends.map(person=>row(person.displayName,person.kind==='ai'?'AI 联系人':person.number,person.number,()=>perform(async()=>{
+    const query=contactText(contactQuery.value);
+    const matches=friends.filter(person=>!query||[person.remark,person.displayName,person.number].some(value=>contactText(value).includes(query)));
+    const rows=matches.map(person=>row(person.remark||person.displayName,person.kind==='ai'?'AI 联系人':
+      [person.remark&&person.displayName,person.number].filter(Boolean).join(' · '),person.number,()=>perform(async()=>{
       const response=await api('/direct',{number:person.number});
       goChat(response.conversation.id);
       void sync();
-    })));
-    directory.replaceChildren(...(rows.length?rows:[empty('通讯录还没有好友。用用户号添加朋友。')]));
+    }),'','',false,person));
+    directory.replaceChildren(...(rows.length?rows:[empty(query?'没有匹配的联系人。':'通讯录还没有好友。用用户号添加朋友。')]));
   }
   if(tab==='profile') {
     const profile=el('div',null,'profile');
-    profile.append(avatar(user.displayName,user.number),el('h2',user.displayName),
+    profile.append(personAvatar(user),el('h2',user.displayName),button('更换头像',()=>showAvatarEditor(profile)),
       ...ownNumberControls(),button('意见反馈',showFeedback),button('我的举报',showMyReports),
       policyLink('内容准则','./conduct.html'),policyLink('隐私说明','./privacy.html'),
       policyLink('开源与版本','./source.html'),
@@ -486,11 +663,16 @@ function routeId() {
   if(!location.hash.startsWith('#chat/')) return undefined;
   try { return decodeURIComponent(location.hash.slice(6)) || undefined; } catch {return undefined;}
 }
-function goChat(id) {
+async function goChat(id,focusEditor=false,expectedAccount) {
   tab='messages';
   const route='#chat/'+encodeURIComponent(id);
   if(location.hash!==route) window.history.pushState(null,'',route);
-  void openChat(id);
+  await openChat(id,expectedAccount);
+  const active=document.activeElement;
+  if(focusEditor&&chat===id&&conversation&&!dialog.open&&
+     (active===document.body||active.id==='back'||active.dataset.chatId===id)){
+    (messageBox.readOnly?historyView:messageBox).focus({preventScroll:true});
+  }
 }
 function goTab(next) {
   if(next==='feed') {
@@ -511,6 +693,7 @@ function forgetConversation(id) {
     $('#chat-avatar').replaceChildren();
   } else renderDirectory();
   drafts.delete(id);
+  writeLocalDraft(id);
   persistChatDrafts();
 }
 tabs.forEach(node=>node.addEventListener('click',()=>goTab(node.dataset.tab)));
@@ -551,6 +734,20 @@ async function openFeed(scope) {
   await loadFeed();
 }
 
+const feedImageUrl=(post,position)=>'./api/v1/friend-feed/'+post.id+'/images/'+position;
+
+function openFeedImage(post,position) {
+  const image=el('img',null,'original-image');
+  image.alt='动态原图 '+position;
+  const status=el('p',null,'minor');status.setAttribute('role','status');
+  image.addEventListener('error',()=>{
+    image.hidden=true;
+    status.textContent='这张动态原图已不可查看，请刷新动态。';
+  },{once:true});
+  openDialog('动态原图',[image,status]);
+  image.src=feedImageUrl(post,position);
+}
+
 function feedPost(post) {
   const entry=el('article',null,'feed-post');
   entry.dataset.author=post.author.number;
@@ -562,10 +759,39 @@ function feedPost(post) {
   head.append(avatar(post.author.displayName,post.author.number),identity);
   if(post.author.number===user.number)head.append(button('删除',()=>confirmDeletePost(post),'report-action'));
   else head.append(button('举报动态',()=>showContentReport({
-    kind:'动态',text:post.text,author:post.author,path:'/friend-feed/'+post.id+'/report',
+    kind:'动态',text:post.text||'含 '+(post.images?.length??0)+' 张图片',author:post.author,path:'/friend-feed/'+post.id+'/report',
     available:()=>tab==='feed'&&entry.isConnected,
+    ...(post.images?.length&&{guidance:'举报会保存这条动态的正文和你填写的原因。请在原因里注明涉及的图片编号。'}),
   }),'report-action'));
-  entry.append(head,el('p',post.text,'feed-post__body'));
+  entry.append(head);
+  if(post.text)entry.append(el('p',post.text,'feed-post__body'));
+  if(post.images?.length){
+    const gallery=el('div',null,'feed-images');
+    for(const {position} of post.images){
+      const view=button('',()=>openFeedImage(post,position),'feed-image-button');
+      view.setAttribute('aria-label','查看第 '+position+' 张原图');
+      const thumbnail=el('img');
+      thumbnail.alt='';thumbnail.loading='lazy';thumbnail.src=feedImageUrl(post,position);
+      view.append(thumbnail);gallery.append(view);
+    }
+    entry.append(gallery);
+  }
+  if(Array.isArray(post.recentComments)){
+    const comments=el('div',null,'post-comments');
+    for(const row of post.recentComments){
+      const line=el('p');line.append(el('strong',row.author.displayName+'：'),document.createTextNode(row.text));
+      line.title=row.author.number;comments.append(line);
+    }
+    const control=button('评论',()=>void perform(async()=>{
+      const account=user.number,epoch=generation;
+      const {openComments}=await import('./feed-comments.js');
+      if(generation!==epoch||tab!=='feed'||!entry.isConnected)return;
+      openComments(post,{account,api,el,button,openDialog,closeDialog,clientNonce,textError,
+        current:scope=>generation===epoch&&tab==='feed'&&dialogGeneration===scope,
+        refresh:notice=>loadFeed(null,notice,true)});
+    },control),'report-action');
+    comments.append(control);entry.append(comments);
+  }
   return entry;
 }
 
@@ -633,7 +859,7 @@ async function loadFeed(before=null,notice='',preserveScroll=false) {
   }
   feedStatus.textContent='正在读取动态…';
   try {
-    const params=new URLSearchParams({scope:feedScope});
+    const params=new URLSearchParams({scope:feedScope,comments:'1'});
     if(before!==null)params.set('before',before);
     const payload=await api('/friend-feed?'+params);
     if(!current())return;
@@ -664,33 +890,119 @@ function showPostComposer() {
   const account=user.number, epoch=generation;
   const form=el('form'), label=el('label','动态正文'), input=el('textarea');
   const author=el('p','发布账号 '+user.displayName+'（'+account+'）','feed-composer-author');
-  const note=el('p','你和当前好友可见。以后互加的好友也能查看仍保留的动态。最多 1000 字。','minor');
+  const note=el('p','文字和图片可以单独发。最多 1000 字、3 张静态 PNG 或 JPEG，每张不超过 4 MB。'+
+    '你和当前好友可见。以后互加的好友也能查看仍保留的动态原图；原图可能含拍摄时间或位置。','minor');
+  const files=el('input');files.type='file';files.multiple=true;files.accept='image/png,image/jpeg';
+  const fileLabel=el('label','添加图片');fileLabel.append(files);
+  const gallery=el('div',null,'feed-images');
   const submit=el('button','发布动态','primary');submit.type='submit';
-  input.id='post-content';input.required=true;input.maxLength=2000;
+  const cancel=button('取消',closeDialog);
+  const actions=el('div',null,'actions');actions.append(cancel,submit);
+  input.id='post-content';input.maxLength=2000;
   note.id='post-visibility';
   input.setAttribute('aria-describedby',note.id);
-  input.addEventListener('input',()=>input.setCustomValidity(Array.from(input.value.trim()).length>1000?'动态最多 1000 字。':''));
   input.value=postAttemptFor(account)?.text||'';
   label.htmlFor=input.id;
-  form.append(author,label,input,note,submit);
+  form.append(author,label,input,fileLabel,note,gallery,actions);
   const scope=openDialog('发动态',[form]);
+  const current=()=>scope===dialogGeneration&&epoch===generation;
+  const status=$('#dialog-error');
+  let selected=[], imageAttempt, reading=false;
   input.focus();
+
+  function renderPreviews(){
+    gallery.replaceChildren();
+    selected.forEach(({url},index)=>{
+      const tile=el('div',null,'feed-image-preview'), preview=el('img');
+      preview.alt='所选图片 '+(index+1);preview.src=url;
+      const remove=button('移除',()=>{
+        if(reading||files.disabled)return;
+        selected=selected.filter((_,position)=>position!==index);
+        status.textContent='';
+        renderPreviews();
+        (gallery.children[index]?.querySelector('button')??files).focus();
+      });
+      remove.setAttribute('aria-label','移除第 '+(index+1)+' 张图片');
+      tile.append(preview,remove);gallery.append(tile);
+    });
+  }
+
+  input.addEventListener('input',()=>input.setCustomValidity(Array.from(input.value.trim()).length>1000?'动态最多 1000 字。':''));
+  files.addEventListener('change',async()=>{
+    const picked=[...files.files];files.value='';
+    if(!picked.length)return;
+    status.textContent='';
+    if(selected.length+picked.length>3){
+      status.textContent='每条动态最多 3 张图片。';
+      return;
+    }
+    reading=files.disabled=submit.disabled=true;
+    try{
+      const additions=[];
+      for(const file of picked){
+        if(!file.size||file.size>4*1024*1024)throw Error('图片须在 4 MB 以内。');
+        if(!['image/png','image/jpeg'].includes(file.type))throw Error('请选择静态 PNG 或 JPEG。');
+        const url=await readImageData(file);
+        if(!current())return;
+        const image=new Image();image.src=url;
+        try{await image.decode();}catch{throw Error('无法打开所选图片，请重新选择。');}
+        if(!current())return;
+        additions.push({file,url});
+      }
+      selected=[...selected,...additions];
+      renderPreviews();
+      files.disabled=false;
+      files.focus();
+    }catch(error){
+      if(current())status.textContent=error.message;
+    }finally{
+      reading=files.disabled=submit.disabled=false;
+    }
+  });
+
   form.addEventListener('submit',event=>{
     event.preventDefault();
+    if(!current()||submit.disabled)return;
     const text=input.value.trim();
-    if(!text||scope!==dialogGeneration||epoch!==generation||submit.disabled)return;
+    if(!text&&!selected.length){
+      status.textContent='请填写正文或添加图片。';
+      return;
+    }
     const draft=postAttemptFor(account);
-    const attempt=draft?.text===text?draft:{text,expectedAccount:account,clientId:clientNonce()};
-    savePostAttempt(attempt);
+    const attempt=selected.length?
+      imageAttempt?.selection===selected&&imageAttempt.text===text?imageAttempt:
+        {text,selection:selected,expectedAccount:account,clientId:clientNonce()}:
+      draft?.text===text?draft:{text,expectedAccount:account,clientId:clientNonce()};
+    if(selected.length)imageAttempt=attempt;
+    else savePostAttempt(attempt);
+    input.readOnly=files.disabled=cancel.disabled=true;
+    const removals=gallery.querySelectorAll('button');
+    removals.forEach(control=>control.disabled=true);
     void perform(async()=>{
-      try { await api('/friend-feed',attempt); }
-      catch(error) {
-        if(epoch===generation&&pendingPost===attempt&&['feed_removed','feed_conflict'].includes(error.message))savePostAttempt(null);
+      try{
+        if(attempt.selection){
+          const upload=new FormData();
+          upload.append('text',text);
+          upload.append('expectedAccount',account);
+          upload.append('clientId',attempt.clientId);
+          for(const {file} of attempt.selection)
+            upload.append('images',file,file.type==='image/png'?'image.png':'image.jpg');
+          await api('/friend-feed',upload,{expectedAccount:account,timeoutMs:60000});
+        }else await api('/friend-feed',attempt);
+      }catch(error){
+        if(epoch===generation&&['feed_removed','feed_conflict'].includes(error.message)){
+          if(pendingPost===attempt)savePostAttempt(null);
+          if(imageAttempt===attempt)imageAttempt=undefined;
+        }
         throw error;
+      }finally{
+        input.readOnly=files.disabled=cancel.disabled=false;
+        removals.forEach(control=>control.disabled=false);
       }
       if(epoch!==generation)return;
-      if(pendingPost===attempt)savePostAttempt(null);
-      if(scope===dialogGeneration)closeDialog();
+      if(pendingPost===attempt||attempt.selection&&draft&&postAttemptFor(account)?.clientId===draft.clientId)
+        savePostAttempt(null);
+      if(current())closeDialog();
       if(tab==='feed')await loadFeed(null,'动态已发布。');
     },submit,scope);
   });
@@ -840,8 +1152,37 @@ function chooseMention(person,popup) {
   showChatHeader();
   messageBox.focus();
 }
+const workMenu=$('#work-menu');
+const taskPrefix='给你一个任务：';
+function taskRecipient(){
+  const peer=conversation?.type==='direct'?directAiPeer(conversation):drafts.get(chat)?.target;
+  return peer?.kind==='ai'&&/^bh_[a-f0-9]{21}$/.test(peer.number)&&mentionAvailable(peer)?peer:null;
+}
+$('#compose-task')?.addEventListener('click',()=>{
+  workMenu.open=false;
+  if(!taskRecipient()||messageBox.readOnly)return;
+  const target=drafts.get(chat)?.target;
+  const body=withoutMention(messageBox.value,target);
+  if(!body.trimStart().startsWith(taskPrefix)){
+    if(messageBox.value.length+taskPrefix.length>messageBox.maxLength){
+      $('#send-error').textContent='草稿已满，请缩短后再添加任务。';
+      return;
+    }
+    const mark=target?.marker;
+    const at=mark?.start===0&&messageBox.value.startsWith(mark.text)?mark.text.length:0;
+    messageBox.setRangeText(taskPrefix,at,at,'end');
+    messageBox.dispatchEvent(new Event('input',{bubbles:true}));
+  }
+  messageBox.focus();
+});
 function showMention() {
   const holder=$('#mention-target'),target=conversation?.type==='group'?drafts.get(chat)?.target:undefined;
+  if(workMenu){
+    const recipient=taskRecipient();
+    if(workMenu.dataset.chat!==chat||!recipient)workMenu.open=false;
+    workMenu.dataset.chat=chat||'';
+    workMenu.hidden=!recipient||messageBox.readOnly;
+  }
   holder.hidden=!target;
   holder.replaceChildren();
   if(!target)return;
@@ -858,14 +1199,158 @@ function pickMention(person,id,scope) {
   closeDialog();
   chooseMention(person);
 }
-const canAttach = meta => Boolean(meta && (meta.type==='group'||meta.members.every(member=>member.kind==='human')));
+const canAttach = meta => Boolean(meta && !meta.friendRemoved&&(meta.type==='group'||meta.members.every(member=>member.kind==='human')));
 const canSendPhoto=meta=>canAttach(meta)||!meta?.personalAi&&meta?.cloudChat?.enabled===true;
 const imageUrl = row => './api/v1'+thread(row.conversationId)+'/messages/'+row.id+'/image';
 
 const directAiPeer = meta => meta?.type==='direct'
   ? meta.members.find(person=>person.number!==user?.number&&person.kind==='ai')
   : undefined;
+function showReplyTarget() {
+  const holder=$('#reply-target');
+  if(!holder)return;
+  const id=conversation&&drafts.get(chat)?.replyTo;
+  holder.hidden=!id;
+  const row=id&&visibleHistory().find(row=>row.id===id);
+  holder.querySelector('span').textContent=!id?'':removedMessages.has(id)?'原消息已移除':
+    row?'回复 '+row.sender.displayName+' · '+[...row.text].slice(0,80).join(''):'已选原消息，发送时附上引用';
+}
+const visitFriendPlanet=$('#visit-friend-planet');
+visitFriendPlanet?.addEventListener('click',async()=>{
+  const visit=chatVisit,account=user?.number;
+  const friend=conversation?.type==='direct'&&conversation.members.find(p=>p.kind==='human'&&p.number!==account);
+  if(!account||!friend||conversation.friendRemoved)return;
+  const feedback=$('#send-error');
+  if(!window.arcadeWorldVisit?.open){
+    feedback.textContent='请在 Agent Arcade 桌面版打开这段私聊，拜访好友的星球。';
+    return;
+  }
+  visitFriendPlanet.disabled=true;
+  feedback.textContent='';
+  try{
+    const destination=await api('/friend-planet?number='+encodeURIComponent(friend.number),undefined,{expectedAccount:account});
+    if(chatVisit!==visit||user?.number!==account)return;
+    if(destination.account!==account||destination.number!==friend.number){
+      feedback.textContent='好友或账号已变更，请重新打开私聊。';
+      return;
+    }
+    if(!destination.planetId){
+      feedback.textContent='这位好友目前没有共享可拜访的星球。';
+      return;
+    }
+    const answer=await window.arcadeWorldVisit.open({account,number:friend.number});
+    if(chatVisit!==visit||user?.number!==account)return;
+    if(answer?.state!=='opened')
+      feedback.textContent=answer?.state==='unavailable'?'这位好友目前没有共享可拜访的星球。':
+        answer?.state==='changed'?'好友或账号已变更，请重新打开私聊。':'小星球暂时无法连接，请稍后再试。';
+  }catch(error){
+    if(chatVisit!==visit||user?.number!==account)return;
+    if(error.message==='friends_only')void openChat(chat,account,true);
+    else feedback.textContent='小星球暂时无法连接，请稍后再试。';
+  }finally{visitFriendPlanet.disabled=false;}
+});
+const removeFriendControl=$('#remove-human-friend');
+removeFriendControl?.addEventListener('click',()=>{
+  const account=user?.number,id=chat,revision=membershipRevision;
+  const peer=conversation?.type==='direct'&&conversation.members.find(member=>member.kind==='human'&&member.number!==account);
+  if(!account||!id||!peer||!revision||conversation.friendRemoved)return;
+  const submit=button('确认删除好友',()=>void perform(async()=>{
+    await api(thread(id)+'/remove-friend',{expectedAccount:account,number:peer.number,revision},{expectedAccount:account});
+    if(user?.number===account&&chat===id)await openChat(id,account,true);
+    if(user?.number===account)void sync();
+  },submit,scope),'primary');
+  const actions=el('div',null,'actions');
+  actions.append(button('取消',closeDialog),submit);
+  const scope=openDialog('删除好友',[
+    el('p','删除 '+peer.displayName+'（'+peer.number+'）？'),
+    el('p','删除后，双方仍可查看已有私聊，也可继续在共同群里聊天。私聊发消息、好友动态和从私聊拜访星球需要重新互加好友。','minor'),
+    actions,
+  ],id);
+});
+const reconnectArea=el('div',null,'actions friend-reconnect');
+const reconnectStatus=el('span','已发送好友申请，等待对方接受。','minor');
+reconnectStatus.setAttribute('role','status');
+const reconnectAction=button('重新添加好友',()=>void reconnectFriend(),'primary');
+reconnectArea.append(reconnectAction,reconnectStatus);
+$('#send-error').after(reconnectArea);
+function renderReconnectAction() {
+  const peer=conversation?.friendRemoved&&conversation.members.find(member=>member.number!==user?.number);
+  reconnectArea.hidden=!peer;
+  const request=peer&&incoming.find(item=>item.from.number===peer.number&&item.to.number===user?.number);
+  const pending=peer&&!request&&outgoing.some(item=>item.to.number===peer.number);
+  reconnectStatus.hidden=!pending;
+  reconnectAction.hidden=Boolean(pending);
+  reconnectAction.textContent=request?'接受好友申请':'重新添加好友';
+}
+async function reconnectFriend(){
+  const id=chat, account=user?.number, visit=chatVisit;
+  const peer=conversation?.friendRemoved&&conversation.members.find(member=>member.number!==account&&member.kind==='human');
+  if(!peer||reconnectAction.disabled)return;
+  const current=()=>user?.number===account&&chatVisit===visit&&chat===id&&conversation?.friendRemoved;
+  const review=request=>{
+    const actions=el('div');
+    const scope=openDialog('好友申请',[el('p',peer.displayName+'（'+peer.number+'）发来了好友申请。'),actions],id);
+    actions.append(friendRequestActions(request,scope,node=>{node.replaceWith(el('p','已拒绝这条好友申请。','minor'));renderReconnectAction();}));
+  };
+  const existing=incoming.find(item=>item.from.number===peer.number&&item.to.number===account);
+  if(existing){review(existing);return;}
+  if(outgoing.some(item=>item.to.number===peer.number))return;
+  const feedback=$('#send-error');
+  reconnectAction.disabled=true;
+  feedback.textContent='';
+  try {
+    const {request}=await api('/friend-requests',{number:peer.number,expectedAccount:account},{expectedAccount:account});
+    if(!current())return;
+    if(request?.to.number===peer.number&&request.from.number===account&&!outgoing.some(item=>item.id===request.id))
+      outgoing.push(request);
+  }catch(error){
+    if(!current())return;
+    if(error.message==='incoming_request'){
+      try {
+        const requests=await api('/friend-requests');
+        if(!current())return;
+        const request=requests.incoming.find(item=>item.from.number===peer.number&&item.to.number===account);
+        if(request)review(request);
+        else feedback.textContent='这条申请已处理，请稍后重试。';
+      }catch(refreshError){if(current())feedback.textContent=textError(refreshError);}
+    }else if(error.message==='already_connected')await openChat(id,account,true);
+    else feedback.textContent=textError(error);
+  }finally{
+    reconnectAction.disabled=false;
+    renderReconnectAction();
+    if(user?.number===account)void sync();
+  }
+}
+const remarkControl=button('好友备注',()=>{
+  const id=chat,account=user?.number,visit=chatVisit;
+  const peer=conversation?.type==='direct'&&!conversation.friendRemoved&&
+    conversation.members.find(member=>member.kind==='human'&&member.number!==account);
+  if(!peer)return;
+  const remark=field('备注（仅你可见）','remark',40,friends.find(item=>item.number===peer.number)?.remark??'');
+  remark.input.required=false;
+  const result=el('form'),save=el('button','保存备注','primary');
+  save.type='submit';
+  result.append(el('p',peer.displayName+'（'+peer.number+'）'),remark.node,el('p','清空并保存，即恢复原昵称。','minor'),save);
+  const scope=openDialog('好友备注',[result],id);
+  remark.input.focus();
+  result.addEventListener('submit',event=>{
+    event.preventDefault();
+    void perform(async()=>{
+      const current=()=>chatVisit===visit&&user?.number===account&&scope===dialogGeneration;
+      if(!current())return;
+      const updated=await api(thread(id)+'/friend-remark',{expectedAccount:account,number:peer.number,remark:remark.input.value},{expectedAccount:account});
+      if(user?.number!==account||updated.account!==account||updated.number!==peer.number)return;
+      friends=friends.map(item=>item.number===peer.number?{...item,remark:updated.remark}:item);
+      if(current()){closeDialog();showChatHeader();}
+      renderDirectory();
+      void sync();
+    },save,scope);
+  });
+});
+remarkControl.hidden=true;chatSettings.append(remarkControl);
 function showChatHeader() {
+  showReplyTarget();
+  renderReconnectAction();
   const available=!!conversation, meta=conversation;
   $('#no-chat').hidden=!!chat;
   $('#chat-head').hidden=!available;
@@ -878,8 +1363,11 @@ function showChatHeader() {
     closeMentionSuggestions();
     return;
   }
-  $('#chat-title').textContent=meta.title;
   const peer=meta.members.find(person=>person.number!==user.number);
+  const canRemark=meta.type==='direct'&&peer?.kind==='human'&&!meta.friendRemoved;
+  const privateRemark=canRemark&&friends.find(person=>person.number===peer.number)?.remark;
+  remarkControl.hidden=!canRemark;
+  $('#chat-title').textContent=privateRemark||meta.title;
   const cloud=meta.cloudChat, paused=cloud?.enabled===false;
   const awaitingAiConsent=meta.requiresAiCloudConsent;
   const legacyPersonal=meta.personalAi===true;
@@ -887,19 +1375,23 @@ function showChatHeader() {
   const groupDetail=meta.members.length+' 位群成员'+(aiCount?' · '+aiCount+' 位 AI':'');
   const cloudService=meta.aiProvider?aiService(meta.aiProvider)+' · ':'';
   $('#chat-detail').textContent=meta.type==='group'?groupDetail:
+    meta.friendRemoved?'已不是好友 · 仍可查看历史':
     legacyPersonal?'原有 AI 私聊 · 可查看历史':
-      cloud?cloudService+(paused?'云聊天已关闭':'云聊天已开启'):awaitingAiConsent?cloudService+'未开启云聊天':peer?.kind==='ai'?'AI 联系人':peer?.number||'';
+      cloud?cloudService+(paused?'云聊天已关闭':'云聊天已开启'):awaitingAiConsent?cloudService+'未开启云聊天':peer?.kind==='ai'?'AI 联系人':
+      privateRemark?meta.title+' · '+peer.number:peer?.number||'';
   const aiPeer=directAiPeer(meta);
   const avatarSeed=aiPeer?.number??meta.id;
   const builtinArt=roleArt.get(aiPeer?.number);
+  const humanPeer=meta.type==='direct'&&peer?.kind==='human'?peer:null;
+  if(visitFriendPlanet)visitFriendPlanet.hidden=!humanPeer||meta.friendRemoved;
+  if(removeFriendControl)removeFriendControl.hidden=!humanPeer||meta.friendRemoved;
   const artwork=builtinArt?'./art/'+builtinArt+'.png':
-    aiPeer&&chatPortrait?.visit===chatVisit&&chatPortrait.number===aiPeer.number?chatPortrait.data:undefined;
+    aiPeer&&chatPortrait?.visit===chatVisit&&chatPortrait.number===aiPeer.number?chatPortrait.data:humanAvatarUrl(humanPeer);
   if(!chatAvatar.firstElementChild||chatAvatar.dataset.seed!==avatarSeed||
-    chatAvatar.dataset.name!==meta.title||chatAvatar.dataset.hasArtwork!==String(!!artwork)){
+    chatAvatar.dataset.name!==meta.title||chatAvatar.firstElementChild.querySelector('img')?.getAttribute('src')!==artwork){
     chatAvatar.dataset.seed=avatarSeed;
     chatAvatar.dataset.name=meta.title;
-    chatAvatar.dataset.hasArtwork=String(!!artwork);
-    chatAvatar.replaceChildren(avatar(meta.title,avatarSeed,artwork));
+    chatAvatar.replaceChildren(humanPeer?personAvatar(humanPeer):avatar(meta.title,avatarSeed,artwork));
   }
   $('#members').hidden=meta.type!=='group';
   $('#ai-cloud').hidden=legacyPersonal?!cloud?.enabled:!cloud&&!awaitingAiConsent;
@@ -916,12 +1408,15 @@ function showChatHeader() {
   const hasSettings=!!chatSettings.querySelector('button:not([hidden])');
   $('#chat-settings-toggle').hidden=!hasSettings;
   if(!hasSettings)chatSettings.hidePopover();
-  messageBox.readOnly=legacyPersonal||paused||awaitingAiConsent;
-  messageBox.placeholder=legacyPersonal?'这段原有私聊仅供查看':awaitingAiConsent?'开启云聊天后才能发送':paused?'恢复云聊天后才能发送':'写消息…';
-  composer.querySelector('button[type="submit"]').disabled=legacyPersonal||paused||awaitingAiConsent||sending.has(meta.id)||
+  messageBox.readOnly=Boolean(meta.friendRemoved)||legacyPersonal||paused||awaitingAiConsent;
+  messageBox.placeholder=meta.friendRemoved?'重新成为好友后可发送消息':legacyPersonal?'这段原有私聊仅供查看':awaitingAiConsent?'开启云聊天后才能发送':paused?'恢复云聊天后才能发送':'写消息…';
+  composer.querySelector('button[type="submit"]').disabled=Boolean(meta.friendRemoved)||legacyPersonal||paused||awaitingAiConsent||sending.has(meta.id)||
     !mentionAvailable(drafts.get(meta.id)?.target);
   $('#composer-media').hidden=!canSendPhoto(meta);
+  stickerButton.hidden=!canSendPhoto(meta);
   $('#record-voice').hidden=!canAttach(meta);
+  if($('#attach-file'))$('#attach-file').hidden=!canAttach(meta);
+  if($('#chat-screenshot'))$('#chat-screenshot').hidden=!canSendPhoto(meta);
   $('#mention-member').hidden=meta.type!=='group';
   if(mentionSuggestions)messageBox.setAttribute('aria-autocomplete',meta.type==='group'?'list':'none');
   showMention();
@@ -1172,9 +1667,9 @@ $('#ai-proactive').addEventListener('click',async()=>{
     if(current())body.textContent=textError(error);
   }
 });
-async function openChat(id) {
+async function openChat(id,expectedAccount,reload=false) {
   if(!user) return;
-  if(id===chat && (conversation||!id)) {renderDirectory();showChatHeader();return;}
+  if(!reload&&id===chat && (conversation||!id)) {renderDirectory();showChatHeader();return;}
   stopVoicePlayback();
   if(dialogMessage||chat&&dialogGroup===chat)closeDialog();
   const epoch=generation, visit=++chatVisit;
@@ -1199,7 +1694,9 @@ async function openChat(id) {
   if(!id) return;
   historyView.append(empty('正在打开会话…',button('返回消息',()=>goTab('messages'))));
   try {
-    const [meta, data]=await Promise.all([api(thread(id)),api(thread(id)+'/messages?limit='+pageSize+'&removedAfter=latest')]);
+    const options={expectedAccount};
+    const [meta, data]=await Promise.all([api(thread(id),undefined,options),
+      api(thread(id)+'/messages?limit='+pageSize+'&removedAfter=latest',undefined,options)]);
     if(generation!==epoch||chatVisit!==visit) return;
     conversation=meta.conversation;
     messages=data.messages;
@@ -1207,11 +1704,13 @@ async function openChat(id) {
     moderationCursor=data.moderation?.cursor??0;
     historyFloor=data.moderation?.historyFloor??0;
     membershipRevision=data.moderation?.membershipRevision;
-    const draft=drafts.get(id);
+    const record=draftScope&&!draftScope.tabOnly.has(id)&&readLocalDraft(draftScope.prefix+id);
+    const draft=record?record.draft:drafts.get(id);
     if(draft&&(draft.floor!==historyFloor||(draft.membershipRevision&&draft.membershipRevision!==membershipRevision))){
       drafts.delete(id);
+      writeLocalDraft(id);
       persistChatDrafts();
-    }
+    }else refreshLocalDraft(id);
     messageBox.value=drafts.get(id)?.text||'';
     historyAfter=messages.at(-1)?.id??0;
     readThrough.set(id,Math.max(readThrough.get(id)??0,conversation.readThrough??0));
@@ -1326,6 +1825,12 @@ function voiceOfferControls(message) {
     actions,status);
   return panel;
 }
+// Adapted from Tinode messages-view.jsx. A long pause or local date change starts a new run.
+function sameRun(a,b){
+  if(!a||!b||a.sender.number!==b.sender.number)return false;
+  const first=new Date(a.createdAt),last=new Date(b.createdAt);
+  return first.toDateString()===last.toDateString()&&last-first>=0&&last-first<300000;
+}
 function renderHistory(scroll) {
   const oldTop=historyView.scrollTop, oldHeight=historyView.scrollHeight;
   const imageButtons=new Map([...historyView.querySelectorAll('[data-image-id]')]
@@ -1334,6 +1839,7 @@ function renderHistory(scroll) {
     .map(node=>[Number(node.dataset.voiceId),node]));
   const focusedVoice=document.activeElement?.dataset?.voiceId?document.activeElement:null;
   const focusedAction=document.activeElement?.dataset?.messageAction;
+  const focusedReaction=document.activeElement?.dataset?.messageReaction;
   const focusedAnchor=document.activeElement?.classList.contains('history-anchor')?historyContext?.anchor:undefined;
   const focusedOlder=document.activeElement===olderButton;
   const nodes=[];
@@ -1342,19 +1848,29 @@ function renderHistory(scroll) {
   if(historyContext)nodes.push(latestHistoryButton);
   if(historyContext?.older??older) nodes.push(olderButton);
   if(!rows.length) nodes.push(empty(conversation?.requiresAiCloudConsent?'在上方开启云聊天后，就可以和她打招呼。':'还没有消息。先打个招呼。'));
-  for(const message of rows) {
+  for(const [index,message] of rows.entries()) {
+    const previous=rows[index-1], next=rows[index+1];
+    const day=new Date(message.createdAt).toDateString();
+    if(!previous||day!==new Date(previous.createdAt).toDateString())nodes.push(el('p',time(message.createdAt,dayStamp),'history-day'));
     const mine=message.sender.number===user.number;
     const bubble=el('article',null,'bubble'+(mine?' mine':''));
     bubble.dataset.historyMessage=message.id;
+    const continued=sameRun(previous,message), continues=sameRun(message,next);
+    bubble.dataset.sequence=continued?(continues?'middle':'last'):(continues?'first':'single');
     if(historyContext?.anchor===message.id){bubble.classList.add('history-anchor');bubble.tabIndex=-1;}
     const content=el('div',null,'bubble-content');
-    bubble.append(avatar(message.sender.displayName,message.sender.number),content);
+    const senderProfile=mine?user:conversation?.members.find(member=>member.number===message.sender.number)??message.sender;
+    bubble.append(personAvatar(senderProfile),content);
     const aiLabel=message.sender.aiOwner?' · '+message.sender.aiOwner+' 的 AI':message.sender.kind==='ai'?' · AI':'';
     const sender=mine?'我':message.sender.displayName+aiLabel;
     const address=message.mention?.aiOwner?'@'+message.mention.displayName+'（'+message.mention.aiOwner+' 的 AI）':message.mention&&mentionLabel(message.mention);
     const text=address&&!message.removed?address+' '+message.text:message.text;
     const meta=el('div',null,'meta');
-    meta.append(el('span',sender+'　'+time(message.createdAt)));
+    const label=el('span',sender,'message-sender');
+    const stamp=el('time',time(message.createdAt,clockTime));
+    stamp.dateTime=message.createdAt;
+    stamp.title=time(message.createdAt,reportDate);
+    meta.append(label,stamp);
     if(!message.removed){
       const control=button('⋯',()=>showMessageActions(message.id,control),'message-action-trigger');
       control.dataset.messageAction=message.id;
@@ -1379,6 +1895,12 @@ function renderHistory(scroll) {
       content.append(meta,open);
       const sticker=message.attachment.sticker;
       if(sticker?.source)content.append(el('p',sticker.label,'minor'));
+    }else if(message.attachment?.type==='file'&&!message.removed){
+      const {name,bytes}=message.attachment;
+      const save=el('a','保存文件','save-chat-file');
+      save.href='./api/v1'+thread(message.conversationId)+'/messages/'+message.id+'/file/download?account='+encodeURIComponent(user.number);
+      save.download=name;
+      content.append(meta,el('strong',name,'chat-file-name'),el('small',fileSize(bytes),'minor'),save);
     }else if(message.attachment?.type==='voice'&&!message.removed){
       let control=voiceButtons.get(message.id);
       if(!control){
@@ -1406,6 +1928,7 @@ function renderHistory(scroll) {
       results.append(info);
       content.append(meta,results);
     }else content.append(meta,textBubble(message,text));
+    if(message.quote&&!message.removed)meta.after(quoteControl(message.quote,locateQuotedMessage));
     if(mine&&!message.removed&&message.personalVoiceOffer)content.append(voiceOfferControls(message));
     if(message.imageQuestion){
       const photo=rows.find(row=>row.id===message.imageQuestion.image&&row.attachment?.type==='image'&&!row.removed);
@@ -1415,6 +1938,7 @@ function renderHistory(scroll) {
     if(!message.removed&&message.aiReply==='failed')content.append(el('p',conversation.type==='group'?
       '本条没有收到 AI 回复。消息已发到群里。':paused?'AI 未能回复。':'AI 未能回复。你可以再发一条。','meta'));
     if(!message.removed&&message.aiReply==='pending'&&!paused)content.append(el('p','正在等 AI 回复…','meta'));
+    if(!message.removed&&message.reactions?.length)content.append(messageReactionSummary(message));
     nodes.push(bubble);
   }
   historyView.replaceChildren(...nodes);
@@ -1422,11 +1946,99 @@ function renderHistory(scroll) {
   if(!resolveMessageAction())messageActions.hidePopover();
   if(focusedVoice?.isConnected)focusedVoice.focus({preventScroll:true});
   if(focusedAction)historyView.querySelector('[data-message-action="'+focusedAction+'"]')?.focus({preventScroll:true});
+  if(focusedReaction){
+    const action=focusedReaction.split('/')[0];
+    (historyView.querySelector('[data-message-reaction="'+focusedReaction+'"]')??
+      historyView.querySelector('[data-message-action="'+action+'"]'))?.focus({preventScroll:true});
+  }
   if(focusedAnchor)historyView.querySelector('[data-history-message="'+focusedAnchor+'"]')?.focus({preventScroll:true});
   if(scroll==='end') historyView.scrollTop=historyView.scrollHeight;
   else if(scroll==='prepend') historyView.scrollTop=oldTop+historyView.scrollHeight-oldHeight;
   else historyView.scrollTop=oldTop;
   positionMessageActions();
+}
+const reactionEmojis=new Map([['👍','赞同'],['😂','笑哭'],['❤️','喜欢'],['😮','惊讶'],['👏','鼓掌']]);
+const reactionChoices=$('#message-reaction-choices');
+const pendingReactions=new Set();
+let reactionMutation=0;
+if(reactionChoices)for(const [emoji,label] of reactionEmojis){
+  const choice=button(emoji,()=>{
+    const row=resolveMessageAction();
+    if(row)void changeMessageReaction(row,emoji);
+  });
+  choice.dataset.emoji=emoji;
+  choice.setAttribute('aria-label',label);
+  choice.setAttribute('aria-pressed','false');
+  reactionChoices.append(choice);
+}
+function messageReactionSummary(message){
+  const list=el('div',null,'message-reactions');
+  list.setAttribute('role','group');
+  list.setAttribute('aria-label','表情回应');
+  for(const {emoji,count,mine} of message.reactions){
+    const chip=button(emoji+' '+count,()=>void changeMessageReaction(message,emoji));
+    chip.dataset.messageReaction=message.id+'/'+emoji;
+    chip.setAttribute('aria-label',(reactionEmojis.get(emoji)??emoji)+'，'+count+' 人');
+    chip.setAttribute('aria-pressed',String(mine));
+    chip.disabled=Boolean(conversation?.friendRemoved);
+    list.append(chip);
+  }
+  return list;
+}
+function applyReactionUpdates(updates){
+  if(!updates||!Object.keys(updates).length)return;
+  const update=rows=>rows.map(row=>{
+    const reactions=updates[row.id];
+    if(!reactions||row.removed||JSON.stringify(row.reactions??[])===JSON.stringify(reactions))return row;
+    return {...row,reactions};
+  });
+  const before=visibleHistory();
+  messages=update(messages);
+  if(historyContext)historyContext.messages=update(historyContext.messages);
+  if(visibleHistory().some((row,index)=>row!==before[index])){
+    const selected=resolveMessageAction();
+    if(selected)paintReactionChoices(selected);
+    renderHistory('keep');
+  }
+}
+function paintReactionChoices(message){
+  if(!reactionChoices)return;
+  reactionChoices.hidden=Boolean(conversation?.friendRemoved)||!membershipRevision;
+  for(const choice of reactionChoices.children)
+    choice.setAttribute('aria-pressed',String(!!message.reactions?.some(row=>row.emoji===choice.dataset.emoji&&row.mine)));
+}
+async function changeMessageReaction(message,emoji){
+  const row=visibleHistory().find(item=>item.id===message.id&&!item.removed);
+  if(!row||!user||conversation?.friendRemoved||!membershipRevision)return;
+  const account=user.number,id=chat,epoch=generation,visit=chatVisit,revision=membershipRevision;
+  const token=account+'/'+row.id;
+  if(pendingReactions.has(token))return;
+  const inMenu=messageAction?.id===row.id&&messageActions.matches(':popover-open');
+  const active=!row.reactions?.some(item=>item.emoji===emoji&&item.mine);
+  const current=()=>generation===epoch&&chatVisit===visit&&membershipRevision===revision;
+  pendingReactions.add(token);
+  try {
+    const {reactionUpdates}=await api(thread(id)+'/messages/'+row.id+'/reaction',
+      {expectedAccount:account,revision,emoji,active},{expectedAccount:account});
+    if(!current())return;
+    reactionMutation++;
+    const closeMenu=inMenu&&messageAction?.id===row.id;
+    if(closeMenu)messageActions.hidePopover();
+    applyReactionUpdates(reactionUpdates);
+    if(closeMenu)historyView.querySelector('[data-message-action="'+row.id+'"]')?.focus({preventScroll:true});
+  }catch(error){
+    if(current())(inMenu&&messageAction?.id===row.id?$('#message-action-status'):$('#send-error')).textContent=textError(error);
+  }finally {pendingReactions.delete(token);}
+}
+function visibleReactionIds(){
+  const viewport=historyView.getBoundingClientRect(), ids=[];
+  for(const bubble of historyView.querySelectorAll('[data-history-message]')){
+    const rect=bubble.getBoundingClientRect();
+    if(rect.top>=viewport.bottom)break;
+    if(rect.bottom>viewport.top)ids.push(bubble.dataset.historyMessage);
+    if(ids.length===100)break;
+  }
+  return ids.join(',');
 }
 function resolveMessageAction(){
   if(messageAction?.chat===chat)return visibleHistory().find(row=>row.id===messageAction.id&&!row.removed);
@@ -1448,7 +2060,13 @@ function showMessageActions(id,control){
   if(!row)return;
   historyView.querySelector('[aria-expanded="true"][data-message-action]')?.setAttribute('aria-expanded','false');
   control.setAttribute('aria-expanded','true');
+  paintReactionChoices(row);
+  const reply=$('#reply-message');
+  if(reply)reply.hidden=messageBox.readOnly||sending.has(chat)||!$('#reply-target');
   $('#copy-message').hidden=!!row.attachment;
+  const favorite=$('#save-message-sticker');
+  favorite.hidden=row.attachment?.type!=='image';
+  favorite.disabled=false;favorite.textContent='收藏为表情';
   $('#message-action-status').textContent='';
   messageActions.showPopover({source:control});
   positionMessageActions();
@@ -1467,11 +2085,47 @@ messageActions.addEventListener('keydown',event=>{
   messageActions.hidePopover();
   control?.focus({preventScroll:true});
 });
+$('#reply-message')?.addEventListener('click',()=>{
+  const row=resolveMessageAction();
+  if(!row||messageBox.readOnly||sending.has(chat))return;
+  if(drafts.get(chat)?.replyTo!==row.id)
+    updateChatDraft(chat,{replyTo:row.id,floor:historyFloor,attempt:undefined});
+  messageActions.hidePopover();
+  showReplyTarget();
+  messageBox.focus();
+});
+$('#cancel-reply')?.addEventListener('click',()=>{
+  if(!chat||sending.has(chat))return;
+  updateChatDraft(chat,{replyTo:undefined,attempt:undefined});
+  showReplyTarget();
+  messageBox.focus();
+});
 $('#copy-message').addEventListener('click',async()=>{
   const row=resolveMessageAction();
   if(!row||row.attachment)return;
   try{await navigator.clipboard.writeText(row.text);messageActions.hidePopover();}
   catch{$('#message-action-status').textContent='可选中消息文字手动复制。';}
+});
+$('#save-message-sticker').addEventListener('click',async event=>{
+  const row=resolveMessageAction(),control=event.currentTarget;
+  if(row?.attachment?.type!=='image'||control.disabled)return;
+  const account=user.number, epoch=generation, visit=chatVisit, action=messageAction;
+  const current=()=>generation===epoch&&chatVisit===visit&&messageAction===action&&user?.number===account;
+  control.disabled=true;
+  try{
+    await api('/stickers/save',{expectedAccount:account,chat:row.conversationId,message:row.id},{expectedAccount:account});
+    if(current()){
+      control.textContent='已收藏';
+      $('#message-action-status').textContent='在表情包的「我的收藏」中使用。';
+      positionMessageActions();
+    }
+  }catch(error){
+    if(current()){
+      control.disabled=false;
+      $('#message-action-status').textContent=textError(error);
+      positionMessageActions();
+    }
+  }
 });
 $('#report-message').addEventListener('click',()=>{
   const row=resolveMessageAction();
@@ -1486,13 +2140,17 @@ function mergeHistoryRows(previous,rows,append){
   for(const row of rows) {
     const previous=known.get(row.id);
     if(!previous?append:previous.aiReply==='pending'&&['answered','failed'].includes(row.aiReply)){
-      known.set(row.id,row);
+      known.set(row.id,previous?{...row,reactions:previous.reactions}:row);
       changed=true;
     }
   }
   for(const [id,row] of known) {
+    if(row.quote?.id&&removedMessages.has(row.quote.id)){
+      known.set(id,{...row,quote:{unavailable:true}});
+      changed=true;
+    }
     if(!row.removed&&removedMessages.has(id)){
-      known.set(id,{...row,attachment:undefined,removed:true,text:'[已移除]'});
+      known.set(id,{...row,quote:undefined,attachment:undefined,removed:true,text:'[已移除]'});
       changed=true;
     }
   }
@@ -1501,6 +2159,7 @@ function mergeHistoryRows(previous,rows,append){
 function merge(rows,scroll,removedIds=[],intoContext=false){
   for(const id of removedIds)removedMessages.add(id);
   for(const row of rows)if(row.removed)removedMessages.add(row.id);
+  if(removedIds.length)showReplyTarget();
   historyFinder?.removeResults();
   if(dialogMessage?.chatId===chat&&removedMessages.has(dialogMessage.messageId))closeDialog();
   if(inlineVoice&&removedMessages.has(inlineVoice.id))stopVoicePlayback();
@@ -1523,7 +2182,9 @@ async function syncHistory(loadOlder=false) {
     const pending=messages.find(row=>!row.removed&&row.aiReply==='pending');
     const after=pending?Math.min(pending.id-1,historyAfter):historyAfter;
     const cursor=loadOlder?'before='+(context?.messages??messages)[0].id:'after='+after;
-    const data=await api(thread(id)+'/messages?'+cursor+'&limit='+pageSize+'&removedAfter='+moderationCursor);
+    const reactionIds=loadOlder?'':visibleReactionIds(), reactionAtStart=reactionMutation;
+    const data=await api(thread(id)+'/messages?'+cursor+'&limit='+pageSize+'&removedAfter='+moderationCursor+
+      (reactionIds?'&reactionIds='+reactionIds:''),undefined,{expectedAccount:user.number});
     if(generation!==epoch||chatVisit!==visit||loadOlder&&historyContext!==context) return false;
     if(data.moderation&&(data.moderation.historyFloor!==historyFloor||
       data.moderation.membershipRevision!==membershipRevision)){
@@ -1541,6 +2202,7 @@ async function syncHistory(loadOlder=false) {
     }else historyAfter=Math.max(historyAfter,data.messages.at(-1)?.id??0);
     const nearEnd=historyView.scrollHeight-historyView.scrollTop-historyView.clientHeight<100;
     merge(data.messages,loadOlder?'prepend':nearEnd?'end':'keep',data.moderation?.removedIds,loadOlder&&!!context);
+    if(reactionAtStart===reactionMutation)applyReactionUpdates(data.reactionUpdates);
     if(!loadOlder&&nearEnd)void acknowledgeRead();
     return true;
   } catch(error) {
@@ -1567,24 +2229,41 @@ async function sync() {
   try {
     const [people,requests,threads]=await Promise.all([api('/friends'),api('/friend-requests'),api('/conversations')]);
     if(generation!==epoch||syncFlight!==lock) return;
+    if(people.account!==undefined&&people.account!==user.number){leaveSession();return;}
     const changed=JSON.stringify([friends,incoming,outgoing,conversations])!==JSON.stringify([people.friends,requests.incoming,requests.outgoing,threads.conversations]);
+    const removedFriend=tab==='feed'&&friends.some(friend=>friend.kind==='human'&&!people.friends.some(next=>next.number===friend.number));
     friends=people.friends;incoming=requests.incoming;outgoing=requests.outgoing;conversations=threads.conversations;
+    renderReconnectAction();
     const accessible=new Set(conversations.map(item=>item.id));
     const removedDrafts=[...drafts.keys()].filter(id=>!accessible.has(id));
-    for(const id of removedDrafts)drafts.delete(id);
+    for(const id of removedDrafts){
+      drafts.delete(id);
+      writeLocalDraft(id);
+    }
     if(removedDrafts.length)persistChatDrafts();
     for(const item of conversations)readThrough.set(item.id,Math.max(readThrough.get(item.id)??0,item.readThrough??0));
     if(changed)renderDirectory();
+    if(removedFriend){
+      if(dialog.open&&$('#dialog-body .feed-post__body'))closeDialog();
+      void loadFeed();
+    }
     if(chat&&conversation) {
       const active=conversations.find(item=>item.id===chat);
       if(active) {
-        if(active.cloudChat) {
+        if(active.friendRemoved!==conversation.friendRemoved){
+          await openChat(chat,user.number,true);
+        }else if(active.cloudChat) {
           if(active.cloudChat.revision!==conversation.cloudChat?.revision||
             active.webSearch?.revision!==conversation.webSearch?.revision)applyCloudConversation(active);
         }
         else if(active.title!==conversation.title||active.webSearch?.revision!==conversation.webSearch?.revision||
-          JSON.stringify(active.members)!==JSON.stringify(conversation.members)) {
+            active.type==='direct'&&changed||
+            JSON.stringify(active.members)!==JSON.stringify(conversation.members)) {
+          const avatarsChanged=active.members.some(member=>member.avatarRevision!==
+            conversation.members.find(previous=>previous.number===member.number)?.avatarRevision);
           conversation=active;showChatHeader();
+          if(dialog.open&&dialog.dataset.memberPanel===active.id)showGroupMembers(active);
+          if(avatarsChanged)renderHistory();
         }
       }
 
@@ -1601,7 +2280,7 @@ window.addEventListener('arcade-social-deactivate',()=>{socialVisible=false;});
 window.addEventListener('arcade-social-activate',()=>{socialVisible=true;void sync();});
 window.addEventListener('online',()=>void sync());
 messageBox.addEventListener('input',()=>{
-  if(!chat||!conversation)return;
+  if(!chat||!conversation||refreshLocalDraft(chat))return;
   const saved=drafts.get(chat),target=editedMention(saved?.text||'',messageBox.value,saved?.target);
   updateChatDraft(chat,{floor:historyFloor,text:messageBox.value,target});
   dismissedMention=undefined;
@@ -1683,15 +2362,22 @@ messageBox.addEventListener('keydown',event=>{
 composer.addEventListener('submit',async event=>{
   event.preventDefault();
   const id=chat, epoch=generation, visit=chatVisit;
+  if(id&&refreshLocalDraft(id))return;
   const target=drafts.get(id)?.target;
   const text=withoutMention(messageBox.value,target).trim();
   if(!id||!conversation||!text||composingMessage||sendButton.disabled||!mentionAvailable(target)) return;
+  if(taskRecipient()&&text===taskPrefix){
+    $('#send-error').textContent='请写下要交办的内容。';
+    messageBox.focus();
+    return;
+  }
   const revision=conversation.cloudChat?.revision;
   const mentionAccount=conversation.type==='group'?target?.number:undefined;
+  const replyTo=drafts.get(id)?.replyTo;
   const previous=drafts.get(id)?.attempt;
-  const reusing=previous?.text===text&&previous.mentionAccount===mentionAccount;
+  const reusing=previous?.text===text&&previous.mentionAccount===mentionAccount&&previous.replyTo===replyTo;
   const timeZone=reusing?previous.timeZone:!$('#ai-appointments').hidden?deviceTimeZone():undefined;
-  const attempt={clientId:reusing?previous.clientId:clientNonce(),text,aiConsentRevision:revision,mentionAccount,timeZone};
+  const attempt={clientId:reusing?previous.clientId:clientNonce(),text,aiConsentRevision:revision,mentionAccount,timeZone,replyTo};
   updateChatDraft(id,{floor:historyFloor,text:messageBox.value,attempt});
   sending.add(id);
   showChatHeader();
@@ -1700,12 +2386,14 @@ composer.addEventListener('submit',async event=>{
     const response=await api(thread(id)+'/messages',attempt,
       {expectedAccount:user.number,timeoutMs:conversation?.type==='group'?65000:30000});
     if(generation!==epoch) return;
+    refreshLocalDraft(id);
     const saved=drafts.get(id);
-    const unchanged=saved?.target?.number===mentionAccount&&withoutMention(saved?.text||'',saved?.target).trim()===text;
-    if(saved?.attempt?.clientId===attempt.clientId)
-      updateChatDraft(id,unchanged?{text:undefined,target:undefined,attempt:undefined}:{attempt:undefined});
+    const unchanged=saved?.replyTo===replyTo&&saved?.target?.number===mentionAccount&&withoutMention(saved?.text||'',saved?.target).trim()===text;
+    const sameAttempt=saved?.attempt?.clientId===attempt.clientId;
+    if(sameAttempt)
+      updateChatDraft(id,unchanged?{text:undefined,target:undefined,replyTo:undefined,attempt:undefined}:{attempt:undefined});
     if(chatVisit===visit) {
-      if(unchanged)messageBox.value='';
+      if(sameAttempt&&unchanged)messageBox.value='';
       showMention();
       drawMentionSuggestions();
       merge([response.message,...(response.reply?[response.reply]:[])],'end');
@@ -1716,11 +2404,15 @@ composer.addEventListener('submit',async event=>{
     void sync();
   } catch(error) {
     if(chatVisit===visit&&generation===epoch) {
-      if(error.message==='mention_unavailable') {
+      if(error.message==='reply_unavailable') {
+        $('#send-error').textContent='原消息已移除或不可查看。可取消引用后发送。';
+      } else if(error.message==='mention_unavailable') {
         $('#send-error').textContent='原点名对象已不在群内。请重新点名或明确取消。';
         void sync();
       } else if(error.message==='message_session') {
         leaveSession();
+      } else if(error.message==='friend_removed') {
+        void openChat(id,user.number,true);
       } else if(error.status===403||error.status===404) {
         forgetConversation(id);
         $('#sync-status').textContent=textError(error);
@@ -1733,15 +2425,23 @@ composer.addEventListener('submit',async event=>{
     if(generation===epoch) {sending.delete(id);if(chat===id)showChatHeader();}
   }
 });
+const wideMembers=matchMedia('(min-width: 1024px)');
 function closeDialog() {
+  const returnToMembers=dialog.open&&dialog.dataset.memberPanel!==undefined&&dialog.contains(document.activeElement);
+  delete dialog.dataset.memberPanel;
   ++dialogGeneration;dialogGroup=dialogMessage=undefined;
   clearDialogResources();
   if(dialog.open)dialog.close();
   $('#dialog-body').replaceChildren();
+  if(returnToMembers&&!$('#members').hidden)$('#members').focus({preventScroll:true});
 }
 $('#dialog-close').addEventListener('click',closeDialog);
 dialog.addEventListener('cancel',event=>{event.preventDefault();closeDialog();});
-function openDialog(title, nodes, groupId) {
+function openDialog(title, nodes, groupId, memberPanel=false) {
+  const dock=memberPanel&&wideMembers.matches;
+  if(dialog.open&&dock===dialog.matches(':modal'))dialog.close();
+  if(memberPanel)dialog.dataset.memberPanel=groupId;
+  else delete dialog.dataset.memberPanel;
   ++dialogGeneration;
   clearDialogResources();
   dialogMessage=undefined;
@@ -1749,8 +2449,140 @@ function openDialog(title, nodes, groupId) {
   $('#dialog-title').textContent=title;
   $('#dialog-error').textContent='';
   $('#dialog-body').replaceChildren(...nodes);
-  if(!dialog.open)dialog.showModal();
+  if(!dialog.open){if(dock)dialog.show();else dialog.showModal();}
   return dialogGeneration;
+}
+function showAvatarEditor(profile) {
+  const account=user.number,epoch=generation;
+  const form=el('form'),label=el('label','选择图片（PNG 或 JPEG，4 MB 以内）');
+  const input=el('input');input.type='file';input.accept='image/png,image/jpeg';
+  const preview=el('img',null,'avatar-preview');preview.alt='圆角头像预览';preview.hidden=true;
+  const submit=el('button','保存头像','primary');submit.type='submit';submit.disabled=true;
+  label.append(input);
+  form.append(label,preview,submit);
+  const scope=openDialog('更换头像',[form]);
+  const current=()=>scope===dialogGeneration&&epoch===generation&&user?.number===account;
+  const feedback=$('#dialog-error');
+  let selection;
+  input.addEventListener('change',async()=>{
+    const file=input.files[0];
+    selection=undefined;submit.disabled=true;preview.hidden=true;feedback.textContent='';
+    if(!file)return;
+    try {
+      const prepared=await prepareAvatar(file);
+      if(!current()||input.files[0]!==file)return;
+      selection={...prepared,clientId:clientNonce()};
+      preview.src=prepared.preview;preview.hidden=false;submit.disabled=false;
+    } catch(error) {
+      if(current()&&input.files[0]===file)feedback.textContent=error.message;
+    }
+  });
+  form.addEventListener('submit',event=>{
+    event.preventDefault();
+    if(!current()||!selection||submit.disabled)return;
+    input.disabled=true;
+    void perform(async()=>{
+      try {
+        const {user:saved}=await api('/me/avatar',selection.blob,{expectedAccount:account,
+          image:{mime:'image/png',clientId:selection.clientId}});
+        if(saved?.number!==account||!saved.avatarRevision)throw Error('avatar_unconfirmed');
+        user=saved;
+        if(profile.isConnected)profile.querySelector('.avatar').replaceWith(personAvatar(saved));
+        if(chat){showChatHeader();renderHistory();}
+        if(current())closeDialog();
+      } finally {input.disabled=false;}
+    },submit,scope);
+  });
+}
+
+const stickerButton=button('☺',showStickerPicker);
+stickerButton.setAttribute('aria-label','表情包');
+stickerButton.setAttribute('aria-haspopup','dialog');
+stickerButton.classList.add('sticker-trigger');
+$('#composer-media').prepend(stickerButton);
+function showStickerPicker() {
+  if(!canSendPhoto(conversation))return;
+  const id=chat,epoch=generation,visit=chatVisit,account=user.number,revision=membershipRevision;
+  const bundledPanel=el('div',null,'sticker-picker');
+  const savedPanel=el('div',null,'sticker-picker'),savedTitle=el('h3','我的收藏');
+  const status=el('p','正在读取表情…');status.setAttribute('role','status');
+  const cursors=[null];
+  let page=0,nextBefore=null,sending=false,loading=false;
+  const previous=button('上一页',()=>void readPage(page-1,previous),'outline');
+  const next=button('下一页',()=>void readPage(page+1,next),'outline');
+  const pages=el('div',null,'actions');pages.append(previous,next);pages.hidden=true;
+  const scope=openDialog('表情包',[status,savedTitle,pages,savedPanel,bundledPanel],id);
+  const current=()=>scope===dialogGeneration&&epoch===generation&&visit===chatVisit&&chat===id&&
+    user?.number===account&&membershipRevision===revision;
+
+  function stickerChoice({id:sticker,label},index,saved) {
+    const clientId=clientNonce();
+    const accessibleLabel=saved?label+' '+(index+1):label;
+    const choice=button('',()=>void perform(async()=>{
+      if(sending||loading||!current())return;
+      if(!(saved?canSendPhoto(conversation):canAttach(conversation)))throw Error('sticker_session');
+      sending=true;
+      try {
+        const {message}=await api(thread(id)+'/stickers',{expectedAccount:account,clientId,sticker,revision},{expectedAccount:account});
+        if(!current())return;
+        merge([message],'end');
+        closeDialog();
+        void sync();
+      } finally {sending=false;}
+    },choice,scope));
+    choice.setAttribute('aria-label','发送 '+accessibleLabel);
+    const image=el('img');image.alt='';image.loading='lazy';
+    image.src='./api/v1/stickers/'+encodeURIComponent(sticker)+(saved?'?account='+encodeURIComponent(account):'');
+    choice.append(image,el('span',label));
+    if(!saved)return choice;
+
+    const item=el('div',null,'saved-sticker');
+    const remove=button('取消收藏',()=>void perform(async()=>{
+      if(!current()||sending||loading)return;
+      await api('/stickers/remove',{expectedAccount:account,id:sticker},{expectedAccount:account});
+      if(!current()||!item.isConnected)return;
+      const adjacent=item.nextElementSibling??item.previousElementSibling;
+      item.remove();
+      status.hidden=false;
+      status.textContent='已取消收藏。';
+      (adjacent?.firstElementChild??(!next.hidden?next:!previous.hidden?previous:bundledPanel.firstElementChild)
+        ??$('#dialog-close')).focus();
+    },remove,scope));
+    remove.setAttribute('aria-label','取消收藏 '+accessibleLabel);
+    item.append(choice,remove);
+    return item;
+  }
+
+  async function readPage(index,control) {
+    if(!current()||sending||loading)return;
+    const before=index>page?nextBefore:cursors[index];
+    if(index<0||(index>page&&!before))return;
+    let focus;
+    await perform(async()=>{
+      loading=true;
+      try {
+        const query=before?'?before='+encodeURIComponent(before):'';
+        const {stickers,favorites=[],nextBefore:older=null}=await api('/stickers'+query,undefined,{expectedAccount:account});
+        if(!current())return;
+        page=index;cursors[page]=before;nextBefore=older;
+        savedPanel.replaceChildren(...favorites.map((row,i)=>stickerChoice(row,i,true)));
+        if(!control&&canAttach(conversation))
+          bundledPanel.replaceChildren(...stickers.map((row,i)=>stickerChoice(row,i,false)));
+        previous.hidden=page===0;
+        next.hidden=!nextBefore;
+        pages.hidden=previous.hidden&&next.hidden;
+        savedTitle.hidden=!favorites.length&&pages.hidden;
+        status.hidden=Boolean(favorites.length||bundledPanel.childElementCount);
+        status.textContent=status.hidden?'':'暂无收藏表情。';
+        focus=control&&!control.hidden?control:savedPanel.querySelector('button')??bundledPanel.firstElementChild??$('#dialog-close');
+      } catch(error) {
+        if(current()&&!control)status.textContent='';
+        throw error;
+      } finally {loading=false;}
+    },control,scope);
+    if(current())focus?.focus();
+  }
+  void readPage(0,null);
 }
 // Based on bothouse role-household/rh/static/rh-history.js at 8ec73a8f (Apache-2.0).
 // Cursor search and latest-response wins are kept; the local service supplies a bounded context page.
@@ -1766,6 +2598,28 @@ function highlightHistoryHit(element,text,query){
     i=match+query.length;
   }
   element.append(text.slice(i,end).toWellFormed(),end<text.length?'…':'');
+}
+function displayOriginal(page,messageId){
+  historyContext={anchor:messageId,messages:mergeHistoryRows(page.messages,[],false),older:page.older};
+  resetOlderPage();
+  renderHistory('end');
+  focusOriginal(historyView.querySelector('[data-history-message="'+messageId+'"]'));
+}
+let quoteNavigation=0;
+async function locateQuotedMessage(messageId){
+  const visit=chatVisit,epoch=generation,serial=++quoteNavigation;
+  const current=()=>visit===chatVisit&&epoch===generation&&serial===quoteNavigation;
+  try{
+    const params=new URLSearchParams({account:user.number,around:messageId});
+    const page=await api(thread(chat)+'/history-search?'+params);
+    if(!current())return;
+    if(page.anchor!==messageId||page.historyFloor!==historyFloor||page.membershipRevision!==membershipRevision||
+      removedMessages.has(messageId))throw Error('unknown_message');
+    displayOriginal(page,messageId);
+  }catch(error){
+    if(current())$('#send-error').textContent=error.status===404||error.message==='unknown_message'?
+      '原消息已移除或不可查看。':textError(error);
+  }
 }
 const historySearchButton=$('#history-search');
 // A cached page can load this script before it has the search control.
@@ -1808,14 +2662,8 @@ historySearchButton?.addEventListener('click',()=>{
       if(!inScope(page)||page.anchor!==messageId||removedMessages.has(messageId)){
         status.textContent='这条消息已移除或不可查看。';return;
       }
-      const rows=mergeHistoryRows(page.messages,[],false);
-      historyContext={anchor:messageId,messages:rows,older:page.older};
-      resetOlderPage();
       closeDialog();
-      renderHistory('end');
-      const target=historyView.querySelector('[data-history-message="'+messageId+'"]');
-      target?.scrollIntoView({block:'center'});
-      target?.focus({preventScroll:true});
+      displayOriginal(page,messageId);
     }catch(error){if(current()&&seq===searchSeq)status.textContent=textError(error);}
     finally{if(locateFlight===lock)locateFlight=undefined;}
   }
@@ -2236,69 +3084,163 @@ function showOriginalImage(message) {
     image.alt=sticker.label;
     const details=$('#dialog-body');
     const source=sticker.source;
-    if(source){
+    const drawingSource=sticker.drawingSource;
+    if(drawingSource){
+      note.textContent='聊天中收藏的角色绘图。';
+      details.append(el('p','作画角色：'+drawingSource.author.displayName,'minor'),
+        el('p','原标题：'+drawingSource.title,'minor'));
+    }else if(source){
       note.textContent='另存或转发时，请保留下面的署名、许可与出处。';
       details.append(el('p',source.title+' · '+source.author+' · '+source.license+'（原图未修改）','minor'),
         el('p','出处 '+source.url,'minor image-source'),el('p','许可 '+source.licenseUrl,'minor image-source'));
-    }else details.append(el('p',sticker.label+'。Agent Arcade 原创素材。','minor'));
+    }else details.append(el('p',sticker.label==='收藏表情'?'聊天中收藏的图片。':sticker.label+'。Agent Arcade 原创素材。','minor'));
   }
 }
-$('#attach-image').addEventListener('click',()=>{
+function fileSize(bytes){
+  return bytes.toLocaleString()+' 字节';
+}
+$('#attach-file')?.addEventListener('click',()=>fileDialog());
+function fileDialog(droppedFile){
+  if(!canAttach(conversation))return;
+  const id=chat, account=user.number, visit=chatVisit, epoch=generation, revision=membershipRevision;
+  const label=el('label','选择文件（最多 16 MiB）'),input=el('input'),info=el('p',null,'minor');
+  input.type='file';input.hidden=Boolean(droppedFile);label.append(input);
+  const name=el('strong',null,'chat-file-name');
+  const replaceFile=button('更换文件',()=>input.click(),'outline');
+  let selected,clientId;
+  const submit=button('发送文件',()=>void perform(async()=>{
+    if(!current()||!selected)return;
+    if(!revision||membershipRevision!==revision)throw Error('file_session');
+    input.disabled=replaceFile.disabled=true;
+    try{
+      const sent=await api(thread(id)+'/files',selected,{expectedAccount:account,
+        fileUpload:{name:selected.name,clientId,revision,mime:'application/octet-stream'},timeoutMs:60000});
+      if(current()){merge([sent.message],'end');closeDialog();void sync();}
+    }finally{input.disabled=replaceFile.disabled=false;}
+  },submit,scope),'primary');
+  submit.disabled=true;
+  const fields=droppedFile
+    ? [el('p','发送到「'+conversation.title+'」','minor'),name,info,input,replaceFile,submit]
+    : [label,info,submit];
+  const scope=openDialog('发送文件',fields,id);
+  const current=()=>scope===dialogGeneration&&visit===chatVisit&&epoch===generation&&routeId()===id;
+  const selectFile=file=>{
+    selected=file;clientId=clientNonce();
+    submit.disabled=!selected || selected.size>16*1024*1024;
+    name.textContent=selected?.name??'';
+    info.textContent=selected?(droppedFile?'':selected.name+' · ')+fileSize(selected.size)+(submit.disabled?'，超过 16 MiB':''):'';
+  };
+  input.addEventListener('change',()=>selectFile(input.files[0]));
+  if(droppedFile)selectFile(droppedFile);
+}
+$('#attach-image').addEventListener('click',()=>photoDialog(false));
+const screenshotControl=$('#chat-screenshot');
+screenshotControl?.addEventListener('click',event=>{
+  const request=event.isTrusted?screenshotControl.dataset.arcadeSnipRequest:undefined;
+  delete screenshotControl.dataset.arcadeSnipRequest;
+  photoDialog(true,undefined,request);
+});
+function photoDialog(screenshot,droppedFile,snipRequest){
   if(!canSendPhoto(conversation))return;
   const id=chat, visit=chatVisit, epoch=generation, account=user.number;
+  const revision=membershipRevision;
+  const boundToMembership=screenshot||Boolean(droppedFile);
   const form=el('form'), label=el('label','选择一张图片'), input=el('input'), preview=el('img',null,'attachment-preview');
-  input.type='file';input.accept='image/png,image/jpeg';input.required=true;
+  input.type='file';input.accept='image/png,image/jpeg';input.required=!screenshot&&!droppedFile;
+  input.hidden=Boolean(droppedFile);
   label.append(input);preview.alt='发送预览';preview.hidden=true;
+  const name=el('strong',null,'chat-file-name');
+  const replacePhoto=button('更换图片',()=>input.click(),'outline');
   const submit=el('button','发送图片','primary');submit.type='submit';submit.disabled=true;
-  const direct=conversation.type==='direct'&&conversation.cloudChat?.enabled;
+  const direct=!screenshot && conversation.type==='direct'&&conversation.cloudChat?.enabled;
   const role=direct&&conversation.members.find(member=>member.kind==='ai');
   const provider=conversation.aiProvider;
   const previousDraft=messageBox.value;
   const questionLabel=el('label','同时问 AI（选填）'), question=el('textarea');
   question.rows=2;question.maxLength=500;
-  if(direct&&previousDraft.trim().length<=500)question.value=previousDraft;
+  if(direct&&!droppedFile&&previousDraft.trim().length<=500)question.value=previousDraft;
   questionLabel.append(question);
   const disclose=el('p',null,'minor');
   const notice=el('p',(direct?
     '留空问题即可只发图片。也可以之后打开图片并选「问 AI」。':
-    '会话成员可以查看和另存。')+' 原图可能保留拍摄时间或位置。','minor');
-  form.append(label,notice,preview);
+    '会话成员可以查看和另存。')+(screenshot?'':' 原图可能保留拍摄时间或位置。'),'minor');
+  if(droppedFile)form.append(el('p','发送到「'+conversation.title+'」','minor'),name,input);
+  else form.append(label);
+  form.append(notice,preview);
+  if(droppedFile)form.append(replacePhoto);
   if(direct)form.append(questionLabel,disclose);
   form.append(submit);
   const updateSendLabel=()=>{
     const asks=direct&&question.value.trim();
-    submit.textContent=asks?'发送图片和问题':'发送图片';
+    submit.textContent=asks?'发送图片和问题':screenshot?'发送截图':'发送图片';
     disclose.textContent=asks?'本次会把所选照片的画面和问题发给'+role.displayName+'使用的 '+aiService(provider)+'。拍摄信息会移除，JPEG 仅保留显示方向。':'';
   };
   question.addEventListener('input',updateSendLabel);
   updateSendLabel();
-  const scope=openDialog('发送图片',[form],id);
-  const current=()=>scope===dialogGeneration&&visit===chatVisit&&epoch===generation;
-  let selected;
-  input.addEventListener('change',async()=>{
+  const captureStatus=screenshot&&el('p',snipRequest
+    ? '正在请求打开系统截图工具。'
+    : '可选择已保存的截图，或按 Ctrl+V 粘贴截图。');
+  if(screenshot){
+    label.firstChild.textContent='选择已保存的截图';
+    captureStatus.setAttribute('role','status');
+    form.prepend(captureStatus);
+  }
+  const scope=openDialog(screenshot?'发送截图':'发送图片',[form],id);
+  const current=()=>scope===dialogGeneration&&visit===chatVisit&&epoch===generation&&routeId()===id;
+  let selected,latestFile;
+  input.addEventListener('change',()=>void selectPhoto(input.files[0]));
+  if(droppedFile)void selectPhoto(droppedFile);
+  if(snipRequest){
+    const crop=el('button','应用内截图','outline');
+    crop.type='button';
+    crop.dataset.chatCrop='';
+    crop.hidden=true;
+    crop.addEventListener('arcade-crop-failed',()=>{if(current())captureStatus.textContent='无法打开应用内截图，请重试或选择已保存的截图。';});
+    captureStatus.after(crop);
+    const result=event=>{
+      if(!current()||typeof event.detail!=='string')return;
+      let answer;
+      try{answer=JSON.parse(event.detail);}catch{return;}
+      if(answer?.request!==snipRequest)return;
+      crop.hidden=answer.started===true || document.documentElement.dataset.arcadeChatCrop!=='available';
+      captureStatus.textContent=answer.started===true
+        ? '完成系统框选后，回到这里按 Ctrl+V 粘贴。'
+        : crop.hidden?'无法打开系统截图工具。可选择已保存的截图，或按 Ctrl+V 粘贴已有截图。'
+        :'无法打开系统截图工具。可在应用内选择窗口或屏幕，框选后预览。';
+    };
+    screenshotControl.addEventListener('arcade-chat-snip-result',result);
+    dialogCleanup=()=>screenshotControl.removeEventListener('arcade-chat-snip-result',result);
+  }
+  if(screenshot){
+    form.tabIndex=-1;
+    form.addEventListener('paste',onPaste);
+    form.focus();
+  }
+  function onPaste(event){
+    if(!current()||input.disabled)return;
+    const file=[...event.clipboardData?.files||[]].find(item=>item.type.startsWith('image/'));
+    if(file){event.preventDefault();void selectPhoto(file);}
+  }
+  async function selectPhoto(file){
+    latestFile=file;
+    name.textContent=file?.name??'';
     selected=undefined;submit.disabled=true;preview.hidden=true;preview.removeAttribute('src');
     $('#dialog-error').textContent='';
-    const file=input.files[0];
     if(!file)return;
     try {
       if(!file.size||file.size>4*1024*1024)throw Error('图片须在 4 MB 以内。');
       if(!['image/png','image/jpeg'].includes(file.type))throw Error('请选择静态 PNG 或 JPEG。');
-      const url=await new Promise((resolve,reject)=>{
-        const reader=new FileReader();
-        reader.onload=()=>resolve(reader.result);
-        reader.onerror=()=>reject(Error('无法读取这张图片。'));
-        reader.readAsDataURL(file);
-      });
-      if(!current()||input.files[0]!==file)return;
+      const url=await readImageData(file);
+      if(!current()||latestFile!==file)return;
       preview.src=url;
       try {await preview.decode();}catch {throw Error('无法打开这张图片。');}
-      if(!current()||input.files[0]!==file)return;
+      if(!current()||latestFile!==file)return;
       selected={file,mime:file.type,clientId:clientNonce()};
       preview.hidden=false;submit.disabled=false;
     } catch(error) {
-      if(current()&&input.files[0]===file)$('#dialog-error').textContent=error.message;
+      if(current()&&latestFile===file)$('#dialog-error').textContent=error.message;
     }
-  });
+  }
   form.addEventListener('submit',event=>{
     event.preventDefault();
     if(!selected||submit.disabled||!current())return;
@@ -2306,10 +3248,11 @@ $('#attach-image').addEventListener('click',()=>{
     const chosenQuestion=direct?question.value.trim():'';
     if(chosenQuestion&&previousDraft.trim()===chosenQuestion&&drafts.get(id)?.text===previousDraft)
       updateChatDraft(id,{submittedPhotoText:chosenQuestion});
-    input.disabled=question.disabled=true;
+    input.disabled=question.disabled=replacePhoto.disabled=true;
     void perform(async()=>{
       try {
-        const {message}=await api(thread(id)+'/images',file,{expectedAccount:account,image:{clientId,mime}});
+        if(boundToMembership&&(!revision||membershipRevision!==revision))throw Error('file_session');
+        const {message}=await api(thread(id)+'/images',file,{expectedAccount:account,image:{clientId,mime,...(boundToMembership&&{revision})}});
         if(!current())return;
         merge([message],'end');
         if(chosenQuestion){
@@ -2324,7 +3267,9 @@ $('#attach-image').addEventListener('click',()=>{
           const response=await api(route,selected.attempt);
           if(!current())return;
           merge([response.message,...(response.reply?[response.reply]:[])],'end');
-          if(previousDraft.trim()===chosenQuestion&&messageBox.value===previousDraft){
+          refreshLocalDraft(id);
+          if(previousDraft.trim()===chosenQuestion&&messageBox.value===previousDraft&&
+             drafts.get(id)?.submittedPhotoText===chosenQuestion){
             messageBox.value='';
             updateChatDraft(id,{floor:historyFloor,text:''});
           }
@@ -2335,10 +3280,37 @@ $('#attach-image').addEventListener('click',()=>{
       } catch(error) {
         if(current()&&error.message==='unknown_chat')forgetConversation(id);
         throw error;
-      } finally {input.disabled=question.disabled=false;}
+      } finally {input.disabled=question.disabled=replacePhoto.disabled=false;}
     },submit,scope);
   });
+}
+function canDropAttachment(event){
+  return user&&chat&&routeId()===chat&&!composer.hidden&&!dialog.open&&composer.parentElement.contains(event.target)&&
+    (canAttach(conversation)||canSendPhoto(conversation));
+}
+
+document.addEventListener('dragover',event=>{
+  if(!event.dataTransfer?.types.includes('Files'))return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect=canDropAttachment(event)?'copy':'none';
 });
+document.addEventListener('drop',event=>{
+  if(!event.dataTransfer?.types.includes('Files'))return;
+  event.preventDefault();
+  if(!canDropAttachment(event))return;
+  const files=event.dataTransfer.files, feedback=$('#send-error');
+  if(!files.length)return;
+  if(files.length>1){
+    feedback.textContent='一次只能拖入一个附件，请分开拖入。';
+    return;
+  }
+  const file=files[0], photo=['image/png','image/jpeg'].includes(file.type);
+  feedback.textContent='';
+  if(photo&&canSendPhoto(conversation))photoDialog(false,file);
+  else if(canAttach(conversation))fileDialog(file);
+  else feedback.textContent='当前会话只支持 PNG 或 JPEG 图片。';
+});
+
 async function askAboutPhoto(message){
   const id=chat,account=user.number,route=thread(id)+'/messages/'+message.id;
   const preview=el('img',null,'attachment-preview');
@@ -2442,7 +3414,7 @@ function showMessageReport(message) {
   showContentReport({kind:'消息',text:message.text,available,path:thread(id)+'/messages/'+message.id+'/report',
     context:{chatId:id,messageId:message.id},attachmentType:message.attachment?.type});
 }
-function showContentReport({kind,text,author,path,available,context,attachmentType}) {
+function showContentReport({kind,text,author,path,available,context,attachmentType,guidance}) {
   if(!user||!available())return;
   const account=user.number, epoch=generation;
   const form=el('form'), label=el('label','举报原因'), input=el('textarea');
@@ -2466,7 +3438,7 @@ function showContentReport({kind,text,author,path,available,context,attachmentTy
     form.append(option,description);
   }
   form.append(submit);
-  const guidance=author?'运营方会审核这条动态和你填写的原因。举报副本将留作审核。':
+  guidance??=author?'运营方会审核这条动态和你填写的原因。举报副本将留作审核。':
     '运营方会审核这条消息和你填写的原因。普通问题或建议请用「意见反馈」。';
   const items=[policyLink('内容准则','./conduct.html#reporting')];
   if(author)items.push(el('p',author.displayName+'（'+author.number+'）','minor'));
@@ -2902,34 +3874,74 @@ function showBothousePair(account,paired) {
   });
   if(!paired)input.focus();
 }
+async function openWorldAiChat(account) {
+  await initialSession;
+  if(!socialVisible||user?.number!==account)return;
+  const epoch=generation, route=location.hash, visit=chatVisit, dialogVisit=dialogGeneration;
+  const current=()=>socialVisible&&generation===epoch&&location.hash===route&&
+    chatVisit===visit&&dialogGeneration===dialogVisit;
+  const options={expectedAccount:account};
+  try {
+    const [{contacts},{conversations:threads}]=await Promise.all([
+      api('/ai-contacts',undefined,options),api('/conversations',undefined,options),
+    ]);
+    if(!current())return;
+    const available=new Set(contacts.filter(contact=>contact.kind==='ai'&&
+      contact.source==='bothouse'&&contact.configured===true)
+      .flatMap(contact=>[contact.number,contact.legacyNumber].filter(Boolean)));
+    const existing=threads.filter(meta=>available.has(directAiPeer(meta)?.number));
+    const match=existing.find(meta=>meta.id===chat)||(existing.length===1?existing[0]:undefined);
+    if(match){
+      closeDialog();
+      await goChat(match.id,true,account);
+      return;
+    }
+  } catch(error) {
+    if(!current()||error.status===409)return;
+  }
+  if(current())showAiContacts();
+}
 function showAiContacts() {
   const account=user.number, epoch=generation;
   const list=el('div',null,'ai-role-library');
   const legacy=el('div'),pairing=el('div');
   const scope=openDialog('AI 联系人',[list,pairing,legacy]);
   void perform(async()=>{
-    const {identity}=await api('/personal-ai');
+    const {identity}=await api('/personal-ai',undefined,{expectedAccount:account});
     if(identity&&generation===epoch&&dialogGeneration===scope){
       legacy.append(button('原有 AI 的授权与资料',()=>showLegacyAiSettings(identity)));
     }
   },null,scope);
   void perform(async()=>{
-    const {contacts,directoryStatus}=await api('/ai-contacts');
+    const {contacts,directoryStatus,directoryReason}=await api('/ai-contacts',undefined,{expectedAccount:account});
     if(generation!==epoch||dialogGeneration!==scope)return;
     const roles=contacts.filter(contact=>contact.kind==='ai'&&contact.source==='bothouse'&&contact.configured===true);
     if(directoryStatus)void perform(async()=>{
       let state;
-      try{state=await api('/ai-contacts/pair');}
+      try{state=await api('/ai-contacts/pair',undefined,{expectedAccount:account});}
       catch(error){if(error.status===404)return;throw error;}
       if(generation!==epoch||dialogGeneration!==scope)return;
       if(state.paired===true)pairing.append(button('解除角色配对',()=>showBothousePair(account,true)));
-      else if(state.paired===false&&directoryStatus==='empty'&&!contacts.length)
+      else if(state.paired===false&&directoryStatus==='empty'&&directoryReason!=='no_roles'&&!contacts.length)
         pairing.append(button('使用角色配对码',()=>showBothousePair(account,false)));
     },null,scope);
     if(!roles.length){
-      const notice=directoryStatus==='offline'?'暂时无法连接 Bothouse 角色目录。':
-        directoryStatus?'目前没有可用的 AI 角色。':'当前好友服务没有提供 Bothouse 角色目录。';
-      list.replaceChildren(el('p',notice),el('p',bothouseRoleGuide,'minor'));
+      if(directoryStatus==='offline'){
+        list.replaceChildren(el('p','暂时连不上 Bothouse。'),
+          el('p','请稍后重试。如果仍连不上，请联系这台好友服务的管理员。','minor'),
+          button('重新加载 AI 联系人',showAiContacts));
+      }else if(directoryReason==='no_roles'){
+        list.replaceChildren(el('p','这台 Bothouse 还没有可分享的聊天角色。'),
+          el('p','如果你负责管理这台 Bothouse，请到「更多 → Bothouse」添加一个支持好友聊天的角色。普通朋友可以请管理员添加并分享，之后在这里查看。','minor'),
+          button('刷新 AI 联系人',showAiContacts));
+      }else if(directoryStatus==='empty'){
+        list.replaceChildren(el('p',directoryReason==='not_shared'?
+          '还没有角色分享给当前账号。':'当前账号还没有可用的 AI 联系人。'),
+          el('p','请把自己的用户号告诉分享人。有配对码后在这里使用。如果已获直接授权，刷新即可。','minor'),
+          button('刷新 AI 联系人',showAiContacts));
+      }else{
+        list.replaceChildren(el('p','当前好友服务没有提供可用的 Bothouse 角色目录，请联系管理员。'));
+      }
       return;
     }
     const cards=el('div',null,'ai-role-grid');
@@ -2960,8 +3972,11 @@ function friendRequestActions(request,scope,afterDecline){
       const response=await api('/friend-requests/'+encodeURIComponent(request.id)+'/'+action,{});
       incoming=incoming.filter(item=>item.id!==request.id);
       if(scope===dialogGeneration){
-        if(action==='accept'){closeDialog();goChat(response.conversation.id);}
-        else afterDecline(actions);
+        if(action==='accept'){
+          closeDialog();
+          if(response.conversation.id===chat&&conversation?.friendRemoved)void openChat(chat,user.number,true);
+          else goChat(response.conversation.id);
+        }else afterDecline(actions);
       }
       renderDirectory();void sync();
     },control,scope),action==='accept'?'primary':'outline');
@@ -3400,7 +4415,8 @@ function showGroupMembers(group,{mentionOnly=false}={}) {
   if(!group||group.type!=='group')return;
   const list=el('div'), actions=el('div',null,'actions');
   for(const member of group.members) {
-    const card=el('div',null,'request');
+    const card=el('div',null,mentionOnly?'request':'request group-member-row');
+    if(!mentionOnly)card.append(avatar(member.displayName,member.number));
     card.append(el('strong',member.displayName+(member.kind==='ai'?' · AI':'')),
       el('p',member.number+(member.number===group.ownerNumber?'　群主':''),'minor'),
       button(mentionLabel(member),()=>pickMention(member,group.id,scope)));
@@ -3414,9 +4430,21 @@ function showGroupMembers(group,{mentionOnly=false}={}) {
   actions.append(button('添加成员',()=>showMemberPicker(group),'primary'),
     button('群内 AI',()=>showGroupAi(group)));
   if(group.ownerNumber!==user.number) actions.append(button('退出群聊',()=>confirmLeaveGroup(group)));
-  const scope=openDialog(mentionOnly?'点名群成员':'群成员',mentionOnly?[list]:[actions,list],group.id);
+  const scope=openDialog(mentionOnly?'点名群成员':'群成员',mentionOnly?[list]:[actions,list],group.id,!mentionOnly);
 }
-$('#members').addEventListener('click',()=>showGroupMembers(conversation));
+wideMembers.addEventListener('change',()=>{
+  if(dialog.open&&dialog.dataset.memberPanel===chat)showGroupMembers(conversation);
+});
+dialog.addEventListener('keydown',event=>{
+  if(event.key==='Escape'&&dialog.open&&dialog.dataset.memberPanel&&!dialog.matches(':modal')){
+    event.preventDefault();
+    closeDialog();
+  }
+});
+$('#members').addEventListener('click',()=>{
+  if(dialog.open&&dialog.dataset.memberPanel===chat)closeDialog();
+  else showGroupMembers(conversation);
+});
 $('#mention-member').addEventListener('click',()=>showGroupMembers(conversation,{mentionOnly:true}));
 const startupAuthControls=[...$('#auth-form').elements,$('#auth-switch')];
 for(const control of startupAuthControls)control.disabled=true;
@@ -3428,6 +4456,7 @@ async function restoreInitialSession() {
       const saved=savedChatDrafts();
       if(saved?.account){
         interruptedDrafts=suspendChatDrafts(saved.account,saved.entries,saved.resumeChat??routeId());
+        if(interruptedDrafts)interruptedDrafts.draftEpoch=saved.draftEpoch;
         persistChatDrafts();
         if(location.hash)window.history.replaceState(null,'',location.pathname+location.search);
         noticeExpiredSession();
@@ -3440,6 +4469,7 @@ async function restoreInitialSession() {
   }
 }
 const initialSession=restoreInitialSession();
+window.addEventListener('arcade-world-ai-chat',event=>void openWorldAiChat(event.detail));
 let imageFeedbackVisit=0;
 window.addEventListener('arcade-social-deactivate',()=>{imageFeedbackVisit++;});
 window.addEventListener('arcade-social-image-feedback',async()=>{

@@ -12,6 +12,19 @@
 
 普通朋友在 AI 会话里点「AI 音色」，试听并为角色保存一次。每个会话仍须单独允许当前合成服务，改用另一种合成服务也需要重新允许。选择「停止本会话语音」只影响这里。朋友端只需登录即可收听。AI 按本轮原文合成一条可重播语音，上限为 600 字符和 120 秒。超过上限或合成失败时保留完整文字。要求核对或打字的回合使用文字。真人录音仍为 30 秒。恢复备份会清除旧音色和语音许可，保留已保存音频。
 
+### 小星球居民
+
+需要已有的 Bothouse 好友目录以及支持 App 房主连接的 Little Worlds 服务。管理员在好友服务的启动环境一次配置两个值：
+
+- LITTLE_WORLDS_ORIGIN 填与桌面「更多 → 小星球」完全相同的世界原点。使用 HTTPS，本机可用回环 HTTP。
+- SOCIAL_LITTLE_WORLDS_PUBLISHER 填随该世界源码提供的 scripts/publish-residents.py 的绝对路径，保留其同目录的 resident_portraits.py。它与好友目录使用相同的 BOTHOUSE_DATA_DIR 和 Python 3.11+ 环境。配置须位于好友服务主机。
+
+房主在 App 内着陆自己的星球后点「连接我的 AI」。后台以这个账号当下获准的 Bothouse 角色持续更新公开居民，返回聊天后继续。在原星球点「断开我的 AI」会移除该来源。登出、失去角色授权或好友服务停止后，原档里的房主选择仍可在重新登录、进入原星球时恢复。原世界房主登录仍保留在原设备。
+
+房主在自己的星球点「允许好友来访」，好友可从私聊的「会话设置 → 拜访好友星球」前往。此选择与 AI 居民分开保存，登出、重启仍生效；房主可点「关闭好友来访」。访客只能看到世界服务实际提供的居民状态。旧档仅有本地房主凭据时，先从原设备打开一次建立关联。
+
+配套世界使用随版的 `install.py LittleWorlds --desktop-service /path/to/resources/app/service.json`。安装器从该桌面配置读取好友和世界原点并持久保存。保留好友库和世界库；伙伴分发与独立课程安装见 [Little Worlds 集成](https://github.com/zuiho-kai/bothouse/pull/2181)。好友服务使用同一世界原点签发一分钟有效的一次性票据；世界向配对的好友服务核验后，在当前设备建立它自己的登录会话。
+
 ### 基础服务
 
 先在主机安装 Caddy 2、Node 24.18 或更新的 24.x，以及用于暂存的 Python 3.11+。下面以 `/usr/local/bin/node` 为例，若安装路径不同，同步调整 unit 的 `ExecStart` 和备份命令。服务运行不需要 npm 安装依赖。
@@ -20,10 +33,19 @@ Windows MSIX 与好友服务可同版发行，也可独立升级好友服务。�
 
 服务 ZIP 的 [Git 导出清单](service-archive-paths.txt) 包含 `social/assets/stickers` 下的随版 PNG、可编辑源和授权说明，也包含贴图和真人附图运行依赖的共享模块。浏览器验收脚本和服务测试保存在完整 source.zip 中，部署 ZIP 只带服务所需的代码、资源、许可证和运维文件。部署时保留归档目录结构。用新注册的测试账号打开收到的角色贴图及原图详情，验证运行中的服务可以读取图像并显示来源。
 
+优先取同次交接的服务 ZIP、完整源码 ZIP 和摘要。自行重建时，从冻结的 Bothouse 检出进入 Agent Arcade 模块。Git 从模块目录导出相对路径，生成的服务 ZIP 根目录直接包含 `social/`、`src/` 和许可文件。
+
 ```sh
-# 发行负责人在冻结提交的工作树根目录导出服务 ZIP。
-git archive --format=zip --output=/path/to/AgentArcadeSocialService.zip HEAD -- $(cat social/deploy/service-archive-paths.txt)
+cd integrations/agent-arcade
+freeze=$(git rev-parse HEAD)
+out=$(mktemp -d)
+sed '/^#/d; /^$/d' social/deploy/service-archive-paths.txt |
+  xargs git archive --format=zip --output="$out/AgentArcadeSocialService.zip" "$freeze" --
+git archive --format=zip --output="$out/source.zip" "$freeze"
+printf '%s\n' "$out"
 ```
+
+目录内的 `source.zip` 以 Agent Arcade 模块为根，Windows 构建入口为 `social/windows/pack.cjs`。完整源码和服务 ZIP 归属同一提交，按下节绑定交接清单。
 
 ### 交付此版对应源码
 
@@ -108,6 +130,16 @@ systemctl is-active agent-arcade-social caddy
 ```
 
 ### 正常升级
+
+使用本机 Bothouse 派活的 systemd 部署，在首次启用此版或从旧版切入前，从已暂存的发行目录安装独立任务单元。它与好友服务使用同一服务账号，仅该账号能向本机 Unix 套接字提交认领信息。日常更新只停止好友服务，执行中的任务单元继续使用原发行目录并把结果写回原看板。保留旧发行目录直至这些任务结束。若配置了自定义看板目录，请让任务单元具有与好友服务相同的目录写权限。
+
+```sh
+sudo install -m 0644 "$release/social/deploy/agent-arcade-social-task.socket" \
+  "$release/social/deploy/agent-arcade-social-task@.service" /etc/systemd/system/ &&
+sudo systemctl daemon-reload &&
+sudo systemctl enable --now agent-arcade-social-task.socket &&
+sudo systemctl is-active --quiet agent-arcade-social-task.socket
+```
 
 先按「交付此版对应源码」暂存新发行。沿用现有服务用户、unit、`service.env`、代理和持久库。检查发行说明中的同库升级要求以及新旧随包 unit 差异。若随包 unit 有改动，先核对本机 unit 的兼容性并单独安排该改动。以下命令在一次升级操作中执行，`db` 与 `origin` 按已生效的 `SOCIAL_DB` 与 `SOCIAL_PUBLIC_ORIGIN` 填写，保持原配置文件私密。
 
@@ -238,3 +270,28 @@ node social/deploy/rehearse.cjs /path/to/caddy /path/to/openssl /path/to/new-reh
 - 在 `/etc/agent-arcade-social/service.env` 同时填写 `SOCIAL_PUBLIC_OPERATOR_NAME`（对外公布的运营名称）和 `SOCIAL_PUBLIC_PRIVACY_CONTACT`（公开支持邮箱或不含登录凭据的 HTTPS 地址），重启社交服务后从未登录的浏览器打开 `/privacy.html` 核对显示和链接。两个字段会直接公开，请使用正式联系信息。两项都不设置时，页面会显示尚未公布联系方式；只填一项或格式无效时服务会在启动时报错。回环环境可以完全省略。
 - 确认实际联系入口能处理访问、更正或删除请求，并在公开说明中据实补齐数据库、备份、日志、数据保留与第三方处理做法。配置联系信息本身不代表上线或商店审核完成。
 - 微软 Store 10.5 要求说明个人信息的用途、存储、保护、披露和访问控制；条款适用的第三方分享要取得明确同意并提供在产品中撤回的机制。AI 私聊顶部可关闭云聊天，并在明确同意后恢复。群成员可在「群成员 → 群内 AI」分别同意或撤回自己对鲸鱼娘（DeepSeek）和龙娘（OpenAI GPT）的授权。运营者和发布负责人须核对正式域名、公开说明和实际数据处理。对应服务没有配置密钥时，该角色不可用。回环演练只覆盖本机功能。 [Microsoft Store 10.5](https://learn.microsoft.com/en-us/windows/apps/publish/store-policies#105-personal-information)
+
+### 同机 Bothouse 角色分享
+
+已有 Windows 本机启动器沿用它选中的 Bothouse 实例及好友服务端口。若在同一台主机独立运行 Bothouse，先将实例配置放在服务账号有读写权的私有目录。systemd 示例可用 `/var/lib/agent-arcade-social/bothouse`，该目录应由 `agent-arcade-social` 所有。让 Bothouse 以同一账号使用 `--config <目录>/config.toml`，在现有好友服务配置中把 `BOTHOUSE_DATA_DIR` 指向这一目录，并保持 `SOCIAL_HOST=127.0.0.1`、固定 `SOCIAL_PORT`。首次启动好友服务后即可用 Bothouse 管理页查号。
+
+凭据由好友服务自动写到该实例配置旁的私有文件，原安装包和服务日志不含凭据。重启沿用原实例目录与监听地址。已有账号只需正常登录 App，在通讯录打开获准角色。
+
+#### 独立运行 Bothouse
+
+在同一个 Linux 账号下，从两个终端启动。示例假定 Bothouse 已通过自己的向导保存过角色、管理认证和 Bridge 状态，好友服务已在指定目录解包。把示例路径换成实际私有路径，并使用实际的固定好友服务端口。
+
+```sh
+instance_dir="$HOME/.bothouse"
+bothouse --headless --config "$instance_dir/config.toml"
+```
+
+```sh
+instance_dir="$HOME/.bothouse"
+cd "$HOME/agent-arcade-social/social"
+BOTHOUSE_DATA_DIR="$instance_dir" SOCIAL_HOST=127.0.0.1 SOCIAL_PORT=8787 node server/main.cjs
+```
+
+使用本项目提供的 systemd 服务时，把同样的 `BOTHOUSE_DATA_DIR`、`SOCIAL_HOST` 和 `SOCIAL_PORT` 写入既有 `service.env`。实例目录须位于该服务单元可写的位置，例如 `/var/lib/agent-arcade-social/bothouse`。Bothouse 也用服务账号启动，并把 `--config` 指向该目录。首次成功监听时会自动创建权限为 `0600` 的查号配置。以后按原命令重启即可。改变实例目录或监听地址时应先对齐服务部署配置。
+
+Ubuntu 24.04 WSL2 已用临时 systemd 用户服务跑通首次启动、管理查号、正常用户收角色，以及两端重启后同一角色和旧会话的读取。Windows 本机启动器另有独立实测。

@@ -43,14 +43,76 @@
   const sidebar=document.querySelector('aside.sidebar'),nav=document.querySelector('nav'),main=document.querySelector('main');
   const brand=document.querySelector('.brand')||el('div','brand');brand.classList.add('shell-brand');
   const ws=el('div','shell-ws');ws.setAttribute('role','group');
-  const wsButtons={};
-  for(const name of ['companion','work']){const b=el('button','shell-ws-button');b.type='button';b.id='ws-'+name;b.dataset.workspace=name;b.onclick=()=>setWorkspace(name);wsButtons[name]=b;ws.append(b);}
   const storeSocial=window.arcade?.storeSocial;
+  const wsButtons={};
+  for(const name of ['companion','work']){const b=el('button','shell-ws-button');b.type='button';b.id='ws-'+name;b.dataset.workspace=name;b.onclick=()=>setWorkspace(name);wsButtons[name]=b;if(!storeSocial)ws.append(b);}
   let socialActive=false, socialEpoch=0;
   let socialButton, socialStatus, socialCopy, socialRetry, socialMore, socialMenu, imageReturn, imageFeedbackReturn;
   let supportData, supportPanel, supportLabel, supportAddress, supportCopy, supportStatus;
   const socialTools=[];
   let bothouseActive=false,bothouseEpoch=0,bothousePanel,bothouseBack,bothouseCopy,bothouseRetry,bothouseChoose;
+  let worldActive=false,residentStrip,residentButton,residentRetry,residentNote,residentState,residentBusy=false;
+  let worldFriend,visitsButton,visitsNote,visitSharing;
+  const residentMessages={
+    ready:['连接后，访客可见已授权 AI 的名称、形象和近期活动。好友来访可单独设置。','Visitors can see your connected AI and their recent activity. You can control friend visits separately.'],
+    home:['请先回到自己的星球。','Land on your own planet first.'],
+    connected:['已连接，返回聊天后仍会同步。','Connected. Sync continues while you chat.'],
+    disconnected:['已从本星球移除这组居民。','These residents have been removed from this planet.'],
+    paused:['居民同步已暂停。','Resident sync is paused.'],
+    roles:['请先在通讯录连接可用的 Bothouse 角色。','Connect an authorized Bothouse role in Contacts first.'],
+    other:['这个账号或星球已有其他连接，请在原档案核对。','A different connection exists. Check the original profile.'],
+    unavailable:['暂时连不上居民发布服务，请重试。','Could not reach the resident publisher. Try again.'],
+    configuration:['请让主机管理员核对本世界的居民发布配置。','Ask the host to check publishing for this world.'],
+    login:['好友账号已变，请返回消息后重开。','The Friends account changed. Return to messages and reopen.'],
+    session:['请在游戏中进入自己的星球后再试。','Enter your planet in the game and try again.'],
+    capacity:['发布服务正忙，请稍后重试。','The publisher is busy. Try again shortly.'],
+    busy:['正在同步…','Syncing…']
+  };
+  function drawResidents(){
+    if(!residentStrip||residentStrip.hidden)return;
+    const {state,connected}=residentState;
+    residentButton.textContent=connected?tr('断开我的 AI','Disconnect my AI'):tr('连接我的 AI','Connect my AI');
+    residentButton.disabled=residentBusy;
+    residentRetry.textContent=tr('恢复同步','Resume sync');
+    residentRetry.hidden=!connected||state==='connected';
+    residentRetry.disabled=residentBusy;
+    setText(residentNote,pair(residentMessages[residentBusy?'busy':state]||residentMessages.unavailable));
+  }
+  async function residentsAction(action){
+    if(residentBusy||!worldActive||!bothouseActive)return;
+    const visit=bothouseEpoch;
+    residentBusy=true;drawResidents();
+    try{
+      const value=await window.arcade.storeBothouse({action:'residents-'+action});
+      if(visit===bothouseEpoch&&bothouseActive&&worldActive && value?.state!=='closed'){
+        residentState=value?.state?value:{state:'unavailable',connected:residentState.connected};
+        if(action!=='open'&&!visitsButton.disabled)void visitPreference('visits-status');
+      }
+    }catch{if(visit===bothouseEpoch)residentState={state:'unavailable',connected:residentState.connected};}
+    finally{if(visit===bothouseEpoch){residentBusy=false;drawResidents();}}
+  }
+  async function visitPreference(action){
+    const epoch=bothouseEpoch;
+    visitsButton.disabled=true;
+    const response=await window.arcade.storeBothouse({action}).catch(()=>null);
+    if(epoch!==bothouseEpoch||!worldActive||!bothouseActive)return;
+    const ok=response?.state==='ready';
+    visitSharing=ok?response.sharing:undefined;
+    visitsButton.disabled=false;
+    setText(visitsButton,visitSharing===undefined?tr('重试来访设置','Retry visit settings'):
+      visitSharing?tr('关闭好友来访','Stop friend visits'):tr('允许好友来访','Allow friend visits'));
+    setText(visitsNote,ok?(visitSharing?tr('离线时好友也能从私聊拜访。','Friends can visit from chat while you’re offline.'):''):
+      response?.state==='home'?tr('请先建立自己的家园。','Create your home first.'):tr('暂时无法核对来访设置。','Visit settings are unavailable.'));
+  }
+  const worldMessage={
+    'original-home':['请先在原设备用同一好友账号打开自己的星球，再回到这里重试。','Open your planet on the original device with the same Friends account, then retry here.'],
+    'friend-unavailable':['这位朋友的星球目前无法拜访。','This friend’s planet is currently unavailable.'],
+    loading:['正在打开小星球…','Opening Little Worlds…'],
+    login:['请先返回消息，登录好友账号后再进入小星球。','Return to messages and sign in before opening Little Worlds.'],
+    'friends-offline':['暂时无法核对好友账号。请确认好友服务可用，再重试。','Could not verify your Friends account. Check the Friends service and retry.'],
+    config:['尚未配置可用的小星球地址。','A valid Little Worlds address has not been configured.'],
+    offline:['暂时打不开小星球。请确认世界服务已运行，再重试。','Little Worlds is unavailable. Check the world service and retry.'],
+  };
   const bothouseMessage={
     loading:['正在核对本机 Bothouse…','Checking local Bothouse…'],
     config:['请选择已有的 Bothouse TOML 配置。管理服务须已开启，并写明回环地址和端口。','Choose an existing Bothouse TOML configuration with management enabled and an explicit loopback address and port.'],
@@ -60,15 +122,19 @@
     cancelled:['已取消打开 Bothouse。','Opening Bothouse was cancelled.'],
   };
   function paintBothouse(state){
-    const text=bothouseMessage[state] || bothouseMessage.offline;
+    const messages=worldActive?worldMessage:bothouseMessage;
+    const text=messages[state] || messages.offline;
     bothousePanel.hidden=state==='ready';
     bothouseCopy.textContent=pair(text);
-    bothouseRetry.hidden=bothouseChoose.hidden=state==='loading'||state==='ready';
+    bothouseRetry.hidden=state==='loading'||state==='ready';
+    bothouseChoose.hidden=worldActive||bothouseRetry.hidden;
   }
-  async function showBothouse(action='open'){
+  async function showBothouse(action='open',friend){
+    worldFriend=friend;
     toggleSocialMenu(false,{focus:false});
     leaveSocial();
-    bothouseActive=true;
+    bothouseActive=true;worldActive=action==='world';
+    residentStrip.hidden=true;residentBusy=false;delete bar.dataset.worldResidents;
     const visit=++bothouseEpoch;
     document.documentElement.dataset.storeSocial='open';
     document.documentElement.dataset.storeBothouse='open';
@@ -77,12 +143,23 @@
     bothouseBack.focus({preventScroll:true});
     paintBothouse('loading');
     let state='offline';
-    try{state=await window.arcade.storeBothouse({action,headerBottom:bar.getBoundingClientRect().bottom});}catch{}
-    if(bothouseActive&&visit===bothouseEpoch)paintBothouse(state);
+    try{state=await window.arcade.storeBothouse({action,headerBottom:bar.getBoundingClientRect().bottom,...(friend&&{friend})});}catch{}
+    if(bothouseActive&&visit===bothouseEpoch){
+      paintBothouse(state);
+      if(worldActive&&state==='ready'&&!friend){
+        residentState={state:'ready',connected:false};
+        residentStrip.hidden=false;bar.dataset.worldResidents='open';
+        visitSharing=undefined;
+        setText(visitsButton,tr('正在读取来访设置…','Loading visit settings…'));setText(visitsNote,'');
+        void visitPreference('visits-status');
+        void residentsAction('open');
+      }
+    }
   }
   function leaveBothouse(){
     if(!bothouseActive)return;
     bothouseActive=false;++bothouseEpoch;
+    residentStrip.hidden=true;residentBusy=false;delete bar.dataset.worldResidents;
     delete document.documentElement.dataset.storeBothouse;
     delete document.documentElement.dataset.storeSocial;
     main.inert=false;
@@ -127,15 +204,11 @@
     fitSocial();
     if(focus)(open?socialTools[0].button:socialMore).focus({preventScroll:true});
   }
-  function openLocalTool(destination){
+  function openLocalSettings(section){
     toggleSocialMenu(false,{focus:false});
     leaveSocial();
-    destination();
-    if(document.querySelector('dialog[open]'))return;
-    const heading=main.querySelector('section.view:not([hidden]) :is(h1,h2)');
-    const target=heading?.getClientRects().length?heading:main;
-    target.tabIndex=-1;
-    target.focus({preventScroll:true});
+    open('settings');
+    settingsPage.enter(section);
   }
   if(storeSocial){
     document.documentElement.dataset.storeShell='';
@@ -148,35 +221,48 @@
     socialMore.onclick=()=>toggleSocialMenu(socialMenu.hidden);
     socialMenu=el('section','store-local-tools');socialMenu.id='store-local-tools';socialMenu.hidden=true;
     socialMenu.setAttribute('role','group');
-    function add(label,button,destination){
-      button.type='button';
-      button.onclick=()=>openLocalTool(destination);
+    function add(label,id,section){
+      const button=el('button','shell-ws-button');
+      button.type='button';button.id=id;button.onclick=()=>openLocalSettings(section);
       socialTools.push({label,button});socialMenu.append(button);
     }
-    add(['陪伴','Companion'],wsButtons.companion,()=>open('bot'));
-    add(['创作与图库','Create & gallery'],el('button','shell-ws-button'),()=>{
-      open('bot');
-      if(!window.ArcadeCharacterSticker?.openFromChat())open('characters');
-    });
-    add(['工作','Work'],wsButtons.work,()=>open('scene'));
-    add(['设备','Devices'],el('button','shell-ws-button'),()=>{open('settings');settingsPage.choose('pets');});
-    add(['渠道与账号','Channels & accounts'],el('button','shell-ws-button'),()=>open('connections'));
-    add(['应用设置','App settings'],el('button','shell-ws-button'),()=>open('settings'));
     if(window.arcade.storeBothouse){
       const entry=el('button','shell-ws-button');entry.type='button';entry.id='store-bothouse';
       entry.onclick=()=>void showBothouse();
       socialTools.push({label:['Bothouse 管理','Bothouse management'],button:entry});
       socialMenu.append(entry);
+      const world=el('button','shell-ws-button');world.type='button';world.id='store-world';
+      world.onclick=()=>void showBothouse('world');
+      socialTools.push({label:['小星球','Little Worlds'],button:world});socialMenu.append(world);
       bothouseBack=el('button','shell-ws-button');bothouseBack.type='button';bothouseBack.id='store-bothouse-back';
       bothouseBack.hidden=true;bothouseBack.onclick=()=>void showSocial(true);ws.append(bothouseBack);
+      residentStrip=el('div','store-resident-controls');residentStrip.hidden=true;
+      residentButton=el('button','shell-ws-button');residentButton.type='button';residentButton.id='store-residents';
+      residentButton.onclick=()=>void residentsAction(residentState.connected?'disconnect':'connect');
+      residentRetry=el('button','shell-ws-button');residentRetry.type='button';
+      residentRetry.onclick=()=>void residentsAction('connect');
+      residentNote=el('span','store-resident-note');residentNote.id='store-resident-status';residentNote.setAttribute('role','status');
+      residentButton.setAttribute('aria-describedby',residentNote.id);
+      visitsButton=el('button','shell-ws-button');visitsButton.type='button';visitsButton.id='store-friend-visits';
+      visitsButton.onclick=()=>void visitPreference(visitSharing===undefined?'visits-status':visitSharing?'visits-close':'visits-allow');
+      visitsNote=el('span','store-resident-note');visitsNote.setAttribute('role','status');
+      residentStrip.append(residentButton,residentRetry,residentNote,visitsButton,visitsNote);bar.append(residentStrip);
+      new ResizeObserver(()=>{if(!residentStrip.hidden&&bothouseActive&&worldActive){
+        void window.arcade.storeBothouse({action:'world-layout',headerBottom:bar.getBoundingClientRect().bottom}).catch(()=>{});
+      }}).observe(bar);
       bothousePanel=el('section','shell-social-status');bothousePanel.id='store-bothouse-panel';bothousePanel.hidden=true;
       bothouseCopy=el('p','');bothouseCopy.setAttribute('role','status');
-      bothouseRetry=el('button','shell-ws-button');bothouseRetry.type='button';bothouseRetry.onclick=()=>void showBothouse();
+      bothouseRetry=el('button','shell-ws-button');bothouseRetry.type='button';bothouseRetry.onclick=()=>void showBothouse(worldActive?'world':'open',worldFriend);
       bothouseChoose=el('button','shell-ws-button');bothouseChoose.type='button';bothouseChoose.onclick=()=>void showBothouse('choose');
       bothousePanel.append(bothouseCopy,bothouseRetry,bothouseChoose);document.body.append(bothousePanel);
-      window.arcade.onStoreBothouseUnavailable?.(()=>{if(bothouseActive)paintBothouse('offline');});
-      window.arcade.onStoreBothouseReturn?.(()=>{if(bothouseActive)void showSocial(true);});
+      window.arcade.onStoreBothouseUnavailable?.(()=>{if(bothouseActive){residentStrip.hidden=true;delete bar.dataset.worldResidents;paintBothouse('offline');}});
+      window.arcade.onStoreFriendVisit?.(friend=>{if(socialActive&&!imageFeedbackReturn)void showBothouse('world',friend);});
+      window.arcade.onStoreBothouseReturn?.(intent=>{
+        if(bothouseActive)void showSocial(true,worldActive?intent?.aiChatAccount:undefined);
+      });
     }
+    add(['设备','Devices'],'store-devices','devices');
+    add(['应用设置','App settings'],'store-settings');
     imageReturn=el('button','shell-ws-button');
     imageReturn.type='button';imageReturn.id='store-image-feedback-return';imageReturn.hidden=true;
     imageReturn.onclick=()=>{
@@ -237,7 +323,7 @@
     resize.observe(bar);
     resize.observe(socialMenu);
   }
-  async function showSocial(focus=false){
+  async function showSocial(focus=false,aiChatAccount){
     leaveBothouse();
     toggleSocialMenu(false,{focus:false});
     const epoch=++socialEpoch;
@@ -249,7 +335,7 @@
     paintSocialButtons();
     socialState('loading');
     let loaded=false;
-    try{loaded=await storeSocial({active:true,headerBottom:socialHeaderBottom(),focus,...(imageFeedbackReturn&&{imageFeedback:true})});}catch{}
+    try{loaded=await storeSocial({active:true,headerBottom:socialHeaderBottom(),focus,aiChatAccount,...(imageFeedbackReturn&&{imageFeedback:true})});}catch{}
     if(epoch===socialEpoch){
       socialState(loaded?'ready':'error');
       if(focus&&!loaded)socialRetry.focus({preventScroll:true});
@@ -353,12 +439,13 @@
   main.insertBefore(subnav,main.querySelector('section.view'));
 
   function open(view){
+    if(storeSocial&&view!=='settings')return;
     if(view==='accounts'&&typeof window.openCompanionManager==='function')window.openCompanionManager();
     else if(view==='qq-runtime'&&navButton('qq-runtime')?.hidden)switchView('connections');
     else switchView(view);
   }
   function setWorkspace(name){
-    if(!ORDER[name])return;
+    if(storeSocial||!ORDER[name])return;
     leaveSocial();
     const view=document.body.dataset.view;
     if(WORKSPACE_OF[view]!==name){currentWs=name;open(remembered[name]||ORDER[name][0]);}
@@ -380,15 +467,19 @@
   // Language: the same switch as the top-bar button, where people look for it.
   const languageHead=el('h3',''),languageRow=el('div','language-choice');languageRow.setAttribute('role','group');
   const languageButtons=[['zh','中文'],['en','English']].map(([id,text])=>{const b=el('button','accent-auto',text);b.type='button';b.id='settings-language-'+id;b.lang=id==='zh'?'zh-CN':'en';b.onclick=()=>{if((latest?.config?.language==='zh'?'zh':'en')!==id)language.click();};languageRow.append(b);return {id,b};});
-  face.append(languageHead,languageRow,layoutHead,cardLayouts.node,accentHead,accentNote,cardAccent.node);
+  face.append(languageHead,languageRow);
+  if(!storeSocial)face.append(layoutHead,cardLayouts.node,accentHead,accentNote,cardAccent.node);
   grid?.prepend(face);
   const heading=document.querySelector('#settings-view .page-heading');
-  const settingsPage=window.mountGlobalSettings({grid,heading,gear:settings,openView:open,tr});
+  const settingsPage=window.mountGlobalSettings({grid,heading,gear:settings,openView:open,tr,
+    returnToMessages:storeSocial?()=>void showSocial(true):undefined});
   function openAI(){
+    if(storeSocial)return;
     if(document.body.dataset.view!=='settings')switchView('settings');
     settingsPage.choose('ai');
   }
   function openObserver(){
+    if(storeSocial)return;
     if(document.body.dataset.view!=='settings')switchView('settings');
     settingsPage.choose('observer');
     $('install')?.focus({preventScroll:true});
@@ -418,7 +509,8 @@
   window.renderShell=data=>{
     latest=data;zh=data.config?.language==='zh';
     const root=document.documentElement,view=document.body.dataset.view||'scene',preferred=data.config?.workspace==='work'?'work':'companion';
-    if(lastConfigWs===null){lastConfigWs=preferred;currentWs=WORKSPACE_OF[view]||preferred;}
+    if(storeSocial)currentWs='companion';
+    else if(lastConfigWs===null){lastConfigWs=preferred;currentWs=WORKSPACE_OF[view]||preferred;}
     else if(preferred!==lastConfigWs){lastConfigWs=preferred;if((WORKSPACE_OF[view]||currentWs)!==preferred){currentWs=preferred;open(remembered[preferred]||ORDER[preferred][0]);return;}}
     if(WORKSPACE_OF[view]){currentWs=WORKSPACE_OF[view];remembered[currentWs]=view;}
     if(root.dataset.workspace!==currentWs)root.dataset.workspace=currentWs;
@@ -428,6 +520,7 @@
     if(socialButton){
       setText(socialButton,tr('返回消息','Back to messages'));setText(socialMore,tr('更多','More'));
       if(bothouseBack){
+        drawResidents();
         setText(bothouseBack,tr('返回消息','Back to messages'));
         setText(bothouseRetry,tr('重试','Retry'));
         setText(bothouseChoose,tr('选择 Bothouse 配置…','Choose Bothouse configuration…'));
@@ -450,7 +543,7 @@
       const active=name===group;b.classList.toggle('active',active);if(active)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');
     }
     label(settings,pair(LABELS.settings));settings.classList.toggle('active',view==='settings');if(view==='settings')settings.setAttribute('aria-current','page');else settings.removeAttribute('aria-current');
-    syncPicker(view,data);
+    if(!storeSocial)syncPicker(view,data);
     // Channel sub-navigation
     subnav.hidden=!CHANNEL.includes(view);subnav.setAttribute('aria-label',pair(LABELS.connections));
     setText(subButtons.connections,tr('连接向导','Connection guide'));setText(subButtons.accounts,pair(LABELS.accounts));setText(subButtons['qq-runtime'],pair(LABELS['qq-runtime']));
@@ -479,7 +572,7 @@
     setText(recentTitle,tr('最近的动静','Recent activity'));setText(recentEmpty,tr('还没有新的动静。添加数据源后，日历、文件夹和网页的更新会出现在这里。','Nothing new yet. After you add a source, calendar, folder and web updates appear here.'));
     setText(faceTitle,tr('界面','Interface'));setText(layoutHead,tr('布局','Layout'));setText(accentHead,tr('强调色','Accent colour'));
     setText(accentNote,tr('默认跟随当前角色；也可以固定成一个你喜欢的颜色。文字和按钮会自动保持清晰。','Follows the current character by default, or stays on a colour you pick. Text and buttons keep readable contrast automatically.'));
-    window.ArcadeLayouts?.render(data,{view,workspace:currentWs,language:zh?'zh':'en',zh,tr,target:window.ArcadeTheme?.target(data),bar,main});
+    if(!storeSocial)window.ArcadeLayouts?.render(data,{view,workspace:currentWs,language:zh?'zh':'en',zh,tr,target:window.ArcadeTheme?.target(data),bar,main});
   };
   if(typeof data!=='undefined'&&data)render();
 })();

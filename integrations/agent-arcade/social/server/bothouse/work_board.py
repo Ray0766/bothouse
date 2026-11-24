@@ -50,14 +50,22 @@ def main():
             os.replace(tmp, pointer)
         lease = artifacts / (key + ".worker")
         token = request.get("claim")
+        if action == "cancel" and not item.get("returned_at"):
+            board.update(number, "已撤回")
+            lease.unlink(missing_ok=True)
+            item = board.item_by_id(number)
         if token and (not lease.exists() or lease.read_text(encoding="ascii") != token):
             raise ValueError("obsolete worker claim")
         if lease.exists() and time.time() - lease.stat().st_mtime > 150 and not item.get("returned_at"):
-            board.update(number, "处理失败")
+            board.update(number, "回执待核实")
             lease.unlink()
             if token:
                 raise ValueError("expired worker claim")
             item = board.item_by_id(number)
+        if action == "renew":
+            if not token:
+                raise ValueError("worker claim required")
+            lease.touch()
         claimed = None
         if action == "claim" and item["status"] == "已接单" and not item.get("returned_at"):
             # Persist before calling the role. A restart does not repeat a claimed turn.
@@ -65,7 +73,12 @@ def main():
             lease.write_text(claimed, encoding="ascii")
             board.update(number, "正在处理")
             item = board.item_by_id(number)
-        if action in {"start", "return", "fail"}:
+        waiting = {"input": "等待用户补充材料", "external": "待外部执行者", "backend": "待纯文字执行者"}
+        if action == "defer" and token and not item.get("returned_at"):
+            board.update(number, waiting[request["text"]])
+            lease.unlink(missing_ok=True)
+            item = board.item_by_id(number)
+        if action in {"start", "return", "fail", "uncertain"}:
             # These operations are only available to the local role worker.
             if not item.get("returned_at"):
                 if action == "return":
@@ -78,14 +91,18 @@ def main():
                     if not board.returned(number, role):
                         raise RuntimeError("handback rejected")
                 else:
-                    board.update(number, "正在处理" if action == "start" else "处理失败")
+                    status = {"start": "正在处理", "fail": "处理失败", "uncertain": "回执待核实"}
+                    board.update(number, status[action])
             lease.unlink(missing_ok=True)
             item = board.item_by_id(number)
         if action == "retry" and item["status"] == "处理失败":
             board.update(number, "已接单")
             item = board.item_by_id(number)
         result = {"claimed": claimed, "boardId": number, "key": key, "role": role,
-                  "state": {"正在处理": "running", "处理失败": "failed"}.get(item["status"], "accepted")}
+                  "state": {"正在处理": "running", "处理失败": "failed", "回执待核实": "uncertain"}.get(item["status"], "accepted")}
+        for reason, status in waiting.items():
+            if item["status"] == status:
+                result.update(state="waiting_" + reason)
         if item.get("returned_at"):
             data = json.loads(artifact.read_text(encoding="utf-8"))
             if data["key"] != key or not isinstance(data["result"], str) or not 0 < len(data["result"].strip()) <= 3000:

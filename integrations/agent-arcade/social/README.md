@@ -2,6 +2,8 @@
 
 这是 Agent Arcade 的社交模块。用户在同一产品的好友入口注册自己的用户号，搜索对方、发送申请，对方接受即可私聊。从通讯录选择好友建群，已有成员可再邀请自己的好友。普通用户使用发行包预设的服务。社交账号、好友和消息使用独立数据库，服务启动不读取桌面主人档案、QQ、模型凭据或角色私有记忆。
 
+Windows 聊天中点 **截图** 可调用系统截屏。系统工具无法启动时，点 **应用内截图**，选择窗口或屏幕并截取画面，拖动框选后点 **预览选区**。只有在原会话点 **发送截图** 才上传所选区域。关闭选区或发送预览即可取消。
+
 ## 本机启动
 
 需要 Node.js 24.18 或更新的 24.x。服务使用 Node 自带的 HTTP、scrypt 与 SQLite，无 npm 运行依赖。从 Bothouse 仓库根目录运行以下命令。单独部署时按[单机部署清单](deploy/README.md)一并安装共享模块。
@@ -12,13 +14,25 @@ npm --prefix integrations/agent-arcade/social start
 
 浏览器打开 `http://127.0.0.1:8787/`。两个独立浏览器档案可各自注册一个合成账号；同一档案下的两个标签页共享登录。用户号可由用户选择，昵称可重复。服务重启或换设备后使用原号和密码登录。首版无找回密码和端到端加密。默认数据库在当前操作系统用户目录的 `.agent-arcade-social/social.sqlite`，也可用 `SOCIAL_DB` 指定持久磁盘上的路径。部署进程账户独占此目录的读写权限。
 
+## 朋友第一次使用 / First use
+
+1. 从同一好友服务注册或登录。测试时用两个浏览器档案注册不同用户号。在「通讯录」搜对方号码，发送申请并接受。
+2. 从「消息」打开私聊互发文字。在通讯录选好友可建群。配套 Windows 包使用构建时写入的同一好友服务原点。见 [Windows 构建与安装](windows/README.md)。
+3. 需要 AI 时，由管理员在桌面「更多 → Bothouse 管理」准备并授权角色。收到配对码时，按下文兑换。从「通讯录 → AI 联系人」打开获准角色。私聊直接交办，群内通过 @ 选择已加入的角色。结果回原会话。
+4. 桌面从「更多 → 小星球」进入自己的星球。房主允许来访后，从好友私聊的「会话设置」进入对方星球。返回后继续原会话与草稿。见 [世界安装器](https://github.com/zuiho-kai/bothouse/pull/2181)。
+
+1. Register or sign in on the same Friends service. For a local test, use two browser profiles and different user IDs. In **Contacts**, find the other ID, send a request and accept it.
+2. Open the direct chat in **Messages** and exchange a message. Select friends in Contacts to start a group. A paired Windows package uses the same Friends origin. See [Windows build and installation](windows/README.md).
+3. The operator prepares and shares roles through **More → Bothouse management**. If you receive a pairing code, follow the instructions below. Open an authorized role in **Contacts → AI contacts**. Assign work directly in a private chat, or @ an added role in a group. Results come back to the original chat.
+4. In the desktop app, **More → Little Worlds** opens your home. Once a friend allows visits, use the conversation settings in their private chat. Returning restores the chat and its draft. See the [world installer](https://github.com/zuiho-kai/bothouse/pull/2181).
+
 ## 联系 Bothouse 角色
 
-从 **通讯录 → AI 联系人** 找到当前账号可用的 Bothouse 角色，核对角色名和用户号，点 **打开私聊**。群主可在 **群成员 → 群内 AI** 加入角色，群友在输入框通过 @ 选中它。角色由 Bothouse 提供；目录为空时可从桌面 **更多 → Bothouse 管理** 查看本机实例。
+从 **通讯录 → AI 联系人** 找到当前账号可用的 Bothouse 角色，核对角色名和用户号，点 **打开私聊**。群主可在 **群成员 → 群内 AI** 加入角色，群友在输入框通过 @ 选中它。角色由 Bothouse 提供。目录尚未分享时，请把自己的用户号告诉分享人。服务未连时可点 **重新加载 AI 联系人**，持续失败则联系好友服务管理员。
 
-In **Contacts → AI contacts**, find an available Bothouse role by name and user ID and choose **打开私聊** (Open direct chat). A group owner can add a role under **Group members → Group AI**. In the group composer, select that member with @. If no roles are available, open **More → Bothouse management** in the desktop app.
+In **Contacts → AI contacts**, find an available Bothouse role by name and user ID and choose **打开私聊** (Open direct chat). A group owner can add a role under **Group members → Group AI**. In the group composer, select that member with @. If a role has not been shared with you, tell the person sharing it your user ID. If the directory cannot connect, use **重新加载 AI 联系人** (Reload AI contacts) or tell the Friends service operator.
 
-如果这是首次使用且还没有可用角色，管理员可在好友服务主机确认账号归属并签发一次性配对码。登录对应好友账号，在 **通讯录 → AI 联系人 → 使用角色配对码** 兑换。已获授权的角色会一起出现，普通用户可以直接聊天。[管理员操作](server/bothouse/README.md)
+如果对方用配对码分享角色，管理员会在好友服务主机核对账号归属并签发一次性配对码。登录对应好友账号，在 **通讯录 → AI 联系人 → 使用角色配对码** 兑换。已获授权的角色会一起出现，普通用户可以直接聊天。[管理员操作](server/bothouse/README.md)
 
 For a first-time account with no shared roles, the service host operator can verify the account and issue a one-time pairing code. Sign in to that Friends account and redeem it under **Contacts → AI contacts → 使用角色配对码** (Use a role pairing code). All roles shared with the account then appear together. [Host operator instructions](server/bothouse/README.md)
 
@@ -58,6 +72,10 @@ caddy run --config Caddyfile --adapter caddyfile
 - **正常升级**。用普通备份命令生成一致性快照，停服切换服务版本，继续读取当前持久库，保留现有登录与授权。[正常升级](deploy/README.md#正常升级) · [普通备份命令](deploy/README.md#持久化备份与还原)
 - **灾备恢复旧快照**。按曾写入快照所含数据库的服务版本选择 `social/deploy/backup.cjs --prepare-restore`。在 1.0.21.0 和 1.0.23.0 间，只要 1.0.23.0 写过这份库，即使临时由 1.0.21.0 接管，也须用 1.0.23.0 的工具生成独立恢复副本。版本来历不明时先核对，再开放服务。随后停服保全当前库并换入恢复副本。直接换回旧目录会保留旧登录和旧授权。准备过的副本使旧登录失效，AI 授权需重新取得。[已验命令与切换检查](deploy/README.md#灾备恢复旧快照)
 - **应急回退服务版本**。停服保全当前库，只用独立副本和关闭外部服务的环境启动已验证兼容的旧版。1.0.23.0 回退到 1.0.21.0 仅验真人私聊、群聊文字和原图。切回新版时沿用含回退期间新增消息和原图的库。[旧版授权保护与回退步骤](deploy/README.md#应急回退)
+
+## 给好友看动态
+
+在「动态 → 发动态」可只发文字、只发图片，或同时发文字和图片。每条最多三张静态 PNG 或 JPEG，每张不超过 4 MB。发布前可预览、移除图片或取消；当前好友刷新后可查看动态和原图，也可在原动态下评论。好友关系解除、作者删除动态或运营移除动态后，失去权限的账号重新请求旧原图地址时也无法读取。原图可能保留拍摄时间和位置。
 
 ## 举报处理
 
